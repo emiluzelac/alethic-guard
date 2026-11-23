@@ -1,14 +1,76 @@
 //! The host veth is the only egress path for an unprivileged gateway instance.
 use crate::{GuardResult, collector::public_ip, vm::command};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{ffi::OsStr, net::IpAddr};
 
 const IP: &str = "/usr/sbin/ip";
 const NFT: &str = "/usr/sbin/nft";
 
+#[cfg(test)]
+mod tests;
+
 fn invoke(program: &str, args: &[&str], input: Option<&[u8]>) -> GuardResult<String> {
     let args: Vec<_> = args.iter().map(OsStr::new).collect();
     command(program, &args, input)
+}
+
+fn comparison(left: Value, right: Value) -> Value {
+    json!({"match": {"op": "==", "left": left, "right": right}})
+}
+
+fn payload(protocol: &str, field: &str, value: Value) -> Value {
+    comparison(
+        json!({"payload": {"protocol": protocol, "field": field}}),
+        value,
+    )
+}
+
+fn expression_matches(actual: &Value, expected: &Value) -> bool {
+    if expected.get("counter").is_some() {
+        return actual.as_object().is_some_and(|entry| entry.len() == 1)
+            && actual["counter"]
+                .as_object()
+                .is_some_and(|counts| counts.len() == 2)
+            && actual["counter"]["packets"].is_u64()
+            && actual["counter"]["bytes"].is_u64();
+    }
+    if actual == expected {
+        return true;
+    }
+    if expected.get("masquerade").is_some() {
+        return actual == &json!({"masquerade": {}});
+    }
+
+    // nft can report membership as an anonymous set or a conntrack bitmask list.
+    if !actual.as_object().is_some_and(|entry| entry.len() == 1)
+        || !actual["match"]
+            .as_object()
+            .is_some_and(|entry| entry.len() == 3)
+    {
+        return false;
+    }
+    let actual = &actual["match"];
+    let expected = &expected["match"];
+    let left = &expected["left"];
+    if actual["left"] != *left {
+        return false;
+    }
+    let right = &actual["right"];
+    let op = actual["op"].as_str();
+    let conntrack = left["ct"]["key"] == "state";
+    if let Some(members) = expected["right"]["set"].as_array() {
+        let observed = match op {
+            Some("==" | "in") if right.as_object().is_some_and(|set| set.len() == 1) => {
+                right["set"].as_array()
+            }
+            Some("in") if conntrack => right.as_array(),
+            _ => None,
+        };
+        return observed.is_some_and(|values| {
+            values.len() == members.len() && members.iter().all(|member| values.contains(member))
+        });
+    }
+    conntrack && op == Some("in") && *right == expected["right"]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,54 +147,165 @@ impl Sandbox {
         )?;
         let active = invoke(NFT, &["-j", "list", "table", "inet", &self.table()], None)?;
         let active: Value = serde_json::from_str(&active)?;
+        self.verify_readback(&active, addresses, port)
+    }
+
+    fn verify_readback(self, active: &Value, addresses: &[IpAddr], port: u16) -> GuardResult<()> {
         let list = active["nftables"]
             .as_array()
             .ok_or("invalid nft ruleset observation")?;
-        for (chain, direction) in [
-            ("input", "iifname"),
-            ("forward", "iifname"),
-            ("forward", "oifname"),
-        ] {
-            let covered = list
-                .iter()
-                .filter_map(|value| value.get("rule"))
-                .any(|rule| {
-                    rule["chain"] == chain
-                        && rule["expr"].as_array().is_some_and(|expressions| {
-                            expressions.iter().any(|entry| {
-                                entry["match"]["left"]["meta"]["key"] == direction
-                                    && entry["match"]["right"] == self.host_link()
-                            }) && expressions.iter().any(|entry| entry.get("drop").is_some())
-                        })
-                });
-            if !covered {
-                return Err("gateway default-deny rule readback failed".into());
+        let table = self.table();
+        let link = self.host_link();
+        let interface = |direction| comparison(json!({"meta": {"key": direction}}), json!(link));
+        let drop = |direction| {
+            vec![
+                interface(direction),
+                json!({"counter": null}),
+                json!({"drop": null}),
+            ]
+        };
+        let mut input = Vec::new();
+        let mut forward = Vec::new();
+        let mut postrouting = Vec::new();
+        if addresses.iter().any(IpAddr::is_ipv6) {
+            input.push(vec![
+                interface("iifname"),
+                payload("ip6", "hoplimit", json!(255)),
+                payload(
+                    "icmpv6",
+                    "type",
+                    json!({"set": ["nd-neighbor-solicit", "nd-neighbor-advert"]}),
+                ),
+                json!({"accept": null}),
+            ]);
+        }
+        input.push(drop("iifname"));
+        for address in addresses {
+            let family = if address.is_ipv4() { "ip" } else { "ip6" };
+            let outbound = vec![
+                interface("iifname"),
+                payload(family, "daddr", json!(address.to_string())),
+                payload("tcp", "dport", json!(port)),
+            ];
+            let mut allow = outbound.clone();
+            allow.extend([
+                comparison(
+                    json!({"ct": {"key": "state"}}),
+                    json!({"set": ["new", "established"]}),
+                ),
+                json!({"accept": null}),
+            ]);
+            forward.push(allow);
+            forward.push(vec![
+                interface("oifname"),
+                payload(family, "saddr", json!(address.to_string())),
+                payload("tcp", "sport", json!(port)),
+                comparison(json!({"ct": {"key": "state"}}), json!("established")),
+                json!({"accept": null}),
+            ]);
+            let mut nat = outbound;
+            nat.push(json!({"masquerade": null}));
+            postrouting.push(nat);
+        }
+        forward.extend([drop("iifname"), drop("oifname")]);
+
+        let mut chains = [
+            ("input", "filter", -250, input),
+            ("forward", "filter", -10, forward),
+            ("postrouting", "nat", 100, postrouting),
+        ]
+        .map(|(name, kind, priority, rules)| (name, kind, priority, false, rules.into_iter()));
+        let mut table_seen = false;
+        for row in list {
+            let (kind, item) = row
+                .as_object()
+                .filter(|row| row.len() == 1)
+                .and_then(|row| row.iter().next())
+                .ok_or("invalid nft table entry")?;
+            if kind == "metainfo" && item.is_object() {
+                continue;
+            }
+            if item["family"] != "inet" {
+                return Err("unexpected nft table family".into());
+            }
+            if kind == "table" {
+                if table_seen
+                    || item["name"] != table
+                    || item.get("flags").is_some_and(|flags| flags != &json!([]))
+                {
+                    return Err("gateway table readback does not identify one active table".into());
+                }
+                table_seen = true;
+                continue;
+            }
+            if item["table"] != table {
+                return Err("unexpected nft table entry".into());
+            }
+            match kind.as_str() {
+                "chain" => {
+                    let (name, chain_type, priority, seen, _) = chains
+                        .iter_mut()
+                        .find(|(name, ..)| item["name"] == *name)
+                        .ok_or("unexpected gateway chain")?;
+                    if *seen
+                        || item["type"] != *chain_type
+                        || item["hook"] != *name
+                        || item["prio"] != *priority
+                        || item["policy"] != "accept"
+                    {
+                        return Err(format!("gateway {name} base chain readback mismatch").into());
+                    }
+                    *seen = true;
+                }
+                "rule" => {
+                    let (name, _, _, _, rules) = chains
+                        .iter_mut()
+                        .find(|(name, ..)| item["chain"] == *name)
+                        .ok_or("unexpected gateway rule chain")?;
+                    let expected = rules
+                        .next()
+                        .ok_or_else(|| format!("unexpected rule in gateway {name} chain"))?;
+                    if !item["expr"].as_array().is_some_and(|actual| {
+                        actual.len() == expected.len()
+                            && actual
+                                .iter()
+                                .zip(&expected)
+                                .all(|(actual, expected)| expression_matches(actual, expected))
+                    }) {
+                        return Err(format!("gateway {name} rule readback mismatch").into());
+                    }
+                }
+                _ => return Err("unexpected nft table entry".into()),
             }
         }
-        if addresses.is_empty()
-            && list
+        if !table_seen
+            || chains
                 .iter()
-                .filter_map(|value| value.get("rule"))
-                .any(|rule| {
-                    rule["expr"].as_array().is_some_and(|items| {
-                        items.iter().any(|entry| {
-                            entry.get("accept").is_some() || entry.get("masquerade").is_some()
-                        })
-                    })
-                })
+                .any(|(_, _, _, seen, rules)| !seen || rules.len() != 0)
         {
-            return Err("gateway cutoff still allows traffic".into());
+            return Err("incomplete gateway table readback".into());
         }
         Ok(())
     }
 
     pub fn link_present(self) -> GuardResult<bool> {
         let links: Value = serde_json::from_str(&invoke(IP, &["-j", "link", "show"], None)?)?;
-        Ok(links
-            .as_array()
-            .ok_or("invalid link observation")?
+        self.observed_link_present(&links)
+    }
+
+    fn observed_link_present(self, links: &Value) -> GuardResult<bool> {
+        let links = links.as_array().ok_or("invalid link observation")?;
+        let host_link = self.host_link();
+        if links.iter().any(|row| row["ifname"] == host_link) {
+            return Ok(true);
+        }
+        if links
             .iter()
-            .any(|row| row["ifname"] == self.host_link()))
+            .any(|row| row["ifname"].as_str().is_none_or(str::is_empty))
+        {
+            return Err("incomplete host link observation".into());
+        }
+        Ok(false)
     }
 
     pub fn ensure_clean(self) -> GuardResult<()> {
@@ -233,10 +406,26 @@ impl Sandbox {
 
 impl Sandbox {
     pub fn stop_helpers(self) -> GuardResult<()> {
-        let ns = self.namespace();
-        if !std::path::Path::new("/run/netns").join(&ns).exists() {
+        self.stop_helpers_with(
+            std::path::Path::new("/run/netns")
+                .join(self.namespace())
+                .try_exists()?,
+            Self::link_present,
+        )
+    }
+
+    fn stop_helpers_with(
+        self,
+        namespace_present: bool,
+        link_present: impl Fn(Self) -> GuardResult<bool>,
+    ) -> GuardResult<()> {
+        if !namespace_present {
+            if link_present(self)? {
+                return Err("gateway namespace name is missing while its host link remains".into());
+            }
             return Ok(());
         }
+        let ns = self.namespace();
         for item in invoke(IP, &["netns", "pids", &ns], None)?.lines() {
             let pid = item.trim().parse::<i32>()?;
             if pid <= 1 {
@@ -288,11 +477,11 @@ impl Sandbox {
         if !invoke(IP, &["netns", "pids", &ns], None)?.trim().is_empty() {
             return Err("gateway namespace still contains processes".into());
         }
-        if self.link_present()? {
+        if link_present(self)? {
             invoke(IP, &["link", "delete", &self.host_link()], None)?;
         }
         invoke(IP, &["netns", "delete", &ns], None)?;
-        if self.link_present()? {
+        if link_present(self)? {
             return Err("gateway link remains attached".into());
         }
         Ok(())

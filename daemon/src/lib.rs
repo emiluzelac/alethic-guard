@@ -1,10 +1,13 @@
+pub mod artifact;
 pub mod auth;
 pub mod broker;
 pub mod collector;
 pub mod effect;
 pub mod evidence;
+pub mod gateway_process;
 pub mod lifecycle;
 pub mod network;
+pub mod policy;
 pub mod protocol;
 pub mod vm;
 

@@ -24,6 +24,9 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Binding {
     pub id: Uuid,
@@ -115,15 +118,28 @@ impl Registry {
         .collect()
     }
 
+    fn cutoff_slots(&self, id: Option<Uuid>) -> GuardResult<Vec<rusqlite::Result<u16>>> {
+        // Cutoff uses only the slot. Keep row errors separate so the sweep can continue.
+        let mut statement = self.conn.prepare(
+            "SELECT slot FROM gateway_bindings WHERE retired=0 AND (?1 IS NULL OR workload=?1)",
+        )?;
+        let rows = statement.query_map([id.map(|value| value.to_string())], |row| row.get(0))?;
+        Ok(rows.collect())
+    }
+
     pub fn set_gateway(
         &mut self,
         binding: Binding,
         active: bool,
         retired: bool,
     ) -> GuardResult<()> {
+        self.set_gateway_slot(binding.slot, active, retired)
+    }
+
+    fn set_gateway_slot(&mut self, slot: u16, active: bool, retired: bool) -> GuardResult<()> {
         self.conn.execute(
             "UPDATE gateway_bindings SET active=?1, retired=?2 WHERE slot=?3",
-            params![active, retired, binding.slot],
+            params![active, retired, slot],
         )?;
         Ok(())
     }
@@ -276,15 +292,39 @@ pub fn start(
 }
 
 pub fn stop(registry: &mut Registry, id: Option<Uuid>) -> GuardResult<()> {
-    for binding in registry.bindings(id)? {
-        let persist = registry.set_gateway(binding, false, false);
-        let sandbox = binding.sandbox()?;
-        let cutoff = sandbox.seal();
-        let stopped = sandbox.stop_helpers();
-        cutoff?;
-        stopped?;
-        persist?;
-        registry.set_gateway(binding, false, true)?;
+    stop_with(registry, id, Sandbox::seal, Sandbox::stop_helpers)
+}
+
+fn stop_with(
+    registry: &mut Registry,
+    id: Option<Uuid>,
+    mut seal: impl FnMut(Sandbox) -> GuardResult<()>,
+    mut stop_helpers: impl FnMut(Sandbox) -> GuardResult<()>,
+) -> GuardResult<()> {
+    let mut failures = Vec::new();
+    for slot in registry.cutoff_slots(id)? {
+        let slot = match slot {
+            Ok(slot) => slot,
+            Err(error) => {
+                failures.push(format!("reading gateway slot: {error}"));
+                continue;
+            }
+        };
+        let persist = registry.set_gateway_slot(slot, false, false);
+        let result = Sandbox::new(slot).and_then(|sandbox| {
+            let cutoff = seal(sandbox);
+            let stopped = stop_helpers(sandbox);
+            cutoff?;
+            stopped?;
+            persist?;
+            registry.set_gateway_slot(slot, false, true)
+        });
+        if let Err(error) = result {
+            failures.push(format!("gateway slot {slot}: {error}"));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(failures.join("\n").into());
     }
     Ok(())
 }

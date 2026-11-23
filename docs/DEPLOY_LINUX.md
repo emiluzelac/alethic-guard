@@ -33,13 +33,13 @@ sudo alethic-guard workload terminate WORKLOAD_ID
 sudo alethic-guard evidence export WORKLOAD_ID --format jsonl --output evidence.jsonl
 ```
 
-libvirt domains are transient. The VM is checked in its paused state before the daemon starts it. Restarting the daemon reconciles outstanding workloads and requires fresh operator release and start. Guest output remains on the launch overlay.
+libvirt domains are transient. The VM is checked in its paused state before the daemon starts it. Restarting the daemon reconciles outstanding workloads and requires fresh operator release and start. Guest output remains on the launch overlay. Guard stages verified image bytes in a root-owned, content-addressed launch store before starting libvirt. Launches with the same digest reuse that read-only snapshot.
 
 ## Mediated preview
 
 Use a disposable Ubuntu 24.04 environment under your control. Keep the guest NIC-free and make the collector reachable only over an isolated lab route. Configure IP forwarding on that host. Reserve the UID range 300001–304094, GID 300000, names `aleg*`/`agw*`/`age*`, and subnet ranges `10.254.0.0/18` and `fd42:a1e7::/32` for Guard. Use secure filesystem ownership and host peer credentials even in the lab.
 
-Install the tested kernel wheel alongside the Python controller. Launch the controller under a dedicated unprivileged UID with a private state directory. Launch the following with the daemon's trusted host configuration. The collector config is a root-owned read-only JSON file containing an exact HTTPS `target`, approved global unicast `addresses`, absolute `gateway` and `controller_socket` paths, `controller_uid`, and optional trusted `ca_file`. Use a certificate for the configured hostname. The mediated example is a template with a synthetic hostname.
+Install Guard with its `controller` extra to use the pinned Alethic kernel wheel from PyPI. Launch the controller under a dedicated unprivileged UID with a private state directory. Launch the following with the daemon's trusted host configuration. The collector config is a root-owned read-only JSON file containing an exact HTTPS `target`, approved global unicast `addresses`, absolute `gateway` and `controller_socket` paths, `controller_uid`, and optional trusted `ca_file`. Use a certificate for the configured hostname. The mediated example is a template with a synthetic hostname.
 
 ```sh
 alethic-guard profile compile policy/examples/allowlisted-api.yaml --mediated-api --output ./broker-lab.json

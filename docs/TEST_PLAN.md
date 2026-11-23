@@ -17,3 +17,7 @@ Use the real host and guest test procedures in [the lab instructions](../tests/l
 | Updated image, policy, or backend | Explicit re-enrollment or requalification before sensitive use. |
 
 Release only configurations with independently reproduced evidence and an independent security assessment. The source-commit wheel used in development is a separate qualification artifact from a published PyPI release.
+
+## Current preview limit
+
+The broker cutoff runs before hypervisor inspection once the daemon begins handling containment. The operator socket still shares its request loop with normal work. Public qualification requires a cutoff path that can preempt that queue and a live test of both cutoff race orderings.

@@ -1,5 +1,6 @@
 use crate::GuardResult;
 use roxmltree::{Document, Node};
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -79,15 +80,239 @@ fn attribute<'a>(node: Option<Node<'a, '_>>, key: &str) -> Option<&'a str> {
     node.and_then(|item| item.attribute(key))
 }
 
+// Each listed child is optional here and may occur at most once. Callers
+// check the required fields and the shapes of children they admit.
+fn has_shape(node: Node<'_, '_>, attrs: &[&str], fields: &[&str]) -> bool {
+    node.attributes()
+        .all(|attr| attr.namespace().is_none() && attrs.contains(&attr.name()))
+        && node.children().all(|item| {
+            if item.is_element() {
+                fields.contains(&item.tag_name().name())
+            } else {
+                !item.is_text() || item.text().is_some_and(|text| text.trim().is_empty())
+            }
+        })
+        && fields.iter().all(|name| {
+            children(node)
+                .filter(|item| item.has_tag_name(*name))
+                .nth(1)
+                .is_none()
+        })
+}
+
+fn device_metadata(device: Node<'_, '_>) -> bool {
+    child(device, "alias")
+        .is_none_or(|alias| has_shape(alias, &["name"], &[]) && alias.attribute("name").is_some())
+        && child(device, "address").is_none_or(|address| {
+            if device.has_tag_name("channel") {
+                has_shape(address, &["type", "controller", "bus", "port"], &[])
+                    && address.attribute("type") == Some("virtio-serial")
+                    && address.attribute("controller") == Some("0")
+                    && address.attribute("bus") == Some("0")
+                    && address.attribute("port") == Some("1")
+            } else {
+                has_shape(
+                    address,
+                    &["type", "domain", "bus", "slot", "function", "multifunction"],
+                    &[],
+                ) && address.attribute("type") == Some("pci")
+            }
+        })
+}
+
+fn file_source(node: Node<'_, '_>, expected: &Path) -> bool {
+    has_shape(node, &["file", "index"], &["seclabel"])
+        && expected
+            .to_str()
+            .is_some_and(|path| node.attribute("file") == Some(path))
+        && child(node, "seclabel").is_none_or(|label| {
+            has_shape(label, &["model", "relabel"], &[])
+                && label.attribute("model") == Some("dac")
+                && label.attribute("relabel") == Some("no")
+        })
+}
+
+fn verified_disk(device: Node<'_, '_>, spec: &DomainSpec) -> Option<&'static str> {
+    if !has_shape(
+        device,
+        &["type", "device"],
+        &[
+            "driver",
+            "source",
+            "target",
+            "readonly",
+            "alias",
+            "address",
+            "backingStore",
+        ],
+    ) || device.attribute("type") != Some("file")
+        || device.attribute("device") != Some("disk")
+    {
+        return None;
+    }
+    let target = child(device, "target")?;
+    let driver = child(device, "driver")?;
+    let source = child(device, "source")?;
+    if !has_shape(target, &["dev", "bus"], &[])
+        || target.attribute("bus") != Some("virtio")
+        || !has_shape(driver, &["name", "type"], &[])
+        || driver.attribute("name") != Some("qemu")
+    {
+        return None;
+    }
+    let readonly = child(device, "readonly");
+    let backing = child(device, "backingStore");
+    match target.attribute("dev")? {
+        "vda"
+            if driver.attribute("type") == Some("qcow2")
+                && readonly.is_none()
+                && file_source(source, &spec.overlay)
+                && backing.is_some_and(|store| {
+                    has_shape(
+                        store,
+                        &["type", "index"],
+                        &["format", "source", "backingStore"],
+                    ) && store.attribute("type") == Some("file")
+                        && child(store, "source").is_some_and(|node| file_source(node, &spec.base))
+                        && child(store, "format").is_some_and(|format| {
+                            has_shape(format, &["type"], &[])
+                                && format.attribute("type") == Some("qcow2")
+                        })
+                        && child(store, "backingStore").is_none_or(|end| has_shape(end, &[], &[]))
+                }) =>
+        {
+            Some("vda")
+        }
+        "vdb"
+            if driver.attribute("type") == Some("raw")
+                && readonly.is_some_and(|node| has_shape(node, &[], &[]))
+                && spec
+                    .input
+                    .as_deref()
+                    .is_some_and(|path| file_source(source, path))
+                && backing.is_none_or(|end| has_shape(end, &[], &[])) =>
+        {
+            Some("vdb")
+        }
+        _ => None,
+    }
+}
+
+fn decimal(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn channel_path(path: &str, domain: Node<'_, '_>, spec: &DomainSpec) -> bool {
-    let Some(id) = domain
-        .attribute("id")
-        .filter(|id| id.bytes().all(|b| b.is_ascii_digit()))
-    else {
+    let Some(id) = domain.attribute("id").filter(|id| decimal(id)) else {
         return false;
     };
     let short: String = spec.name().chars().take(20).collect();
     path == format!("/run/libvirt/qemu/channel/{id}-{short}/dev.alethic.guard.1")
+}
+
+fn verified_channel(channel: Node<'_, '_>, domain: Node<'_, '_>, spec: &DomainSpec) -> bool {
+    spec.broker
+        && has_shape(
+            channel,
+            &["type"],
+            &["source", "target", "alias", "address"],
+        )
+        && channel.attribute("type") == Some("unix")
+        && child(channel, "target").is_some_and(|target| {
+            has_shape(target, &["type", "name", "state"], &[])
+                && target.attribute("type") == Some("virtio")
+                && target.attribute("name") == Some("dev.alethic.guard.1")
+                && matches!(
+                    target.attribute("state"),
+                    None | Some("connected" | "disconnected")
+                )
+        })
+        && match child(channel, "source") {
+            Some(source) => {
+                has_shape(source, &["mode", "path"], &[])
+                    && source.attribute("mode") == Some("bind")
+                    && source
+                        .attribute("path")
+                        .is_some_and(|path| channel_path(path, domain, spec))
+            }
+            None => domain.attribute("id").is_none(),
+        }
+}
+
+fn pty_path<'a>(node: Node<'a, '_>) -> Option<&'a str> {
+    attribute(child(node, "source"), "path")
+}
+
+fn verified_pty(device: Node<'_, '_>, active: bool) -> bool {
+    let console = device.has_tag_name("console");
+    let attrs: &[&str] = if console { &["type", "tty"] } else { &["type"] };
+    if !has_shape(device, attrs, &["source", "target", "alias"])
+        || device.attribute("type") != Some("pty")
+    {
+        return false;
+    }
+    let valid_source = match child(device, "source") {
+        Some(source) => {
+            has_shape(source, &["path"], &[])
+                && source
+                    .attribute("path")
+                    .and_then(|value| value.strip_prefix("/dev/pts/"))
+                    .is_some_and(decimal)
+        }
+        None => !active && !console,
+    };
+    if !valid_source {
+        return false;
+    }
+    let Some(target) = child(device, "target") else {
+        return false;
+    };
+    if target.attribute("port") != Some("0") {
+        return false;
+    }
+    if console {
+        return device.attribute("tty") == pty_path(device)
+            && has_shape(target, &["type", "port"], &[])
+            && target.attribute("type") == Some("serial");
+    }
+    has_shape(target, &["type", "port"], &["model"])
+        && matches!(target.attribute("type"), None | Some("isa-serial"))
+        && child(target, "model").is_none_or(|model| {
+            target.attribute("type") == Some("isa-serial")
+                && has_shape(model, &["name"], &[])
+                && model.attribute("name") == Some("isa-serial")
+        })
+}
+
+fn verified_controller(device: Node<'_, '_>, kind: &str, index: u32, broker: bool) -> bool {
+    match (kind, device.attribute("model")) {
+        ("usb", Some("none")) | ("pci", Some("pcie-root")) => {
+            index == 0 && has_shape(device, &["type", "index", "model"], &["alias"])
+        }
+        ("sata", None) | ("virtio-serial", None) => {
+            (kind == "sata" || broker)
+                && index == 0
+                && has_shape(device, &["type", "index"], &["alias", "address"])
+        }
+        ("pci", Some("pcie-root-port")) => {
+            index > 0
+                && has_shape(
+                    device,
+                    &["type", "index", "model"],
+                    &["model", "target", "alias", "address"],
+                )
+                && child(device, "model").is_some_and(|model| {
+                    has_shape(model, &["name"], &[])
+                        && model.attribute("name") == Some("pcie-root-port")
+                })
+                && child(device, "target").is_some_and(|target| {
+                    has_shape(target, &["chassis", "port"], &[])
+                        && target.attribute("chassis").is_some()
+                        && target.attribute("port").is_some()
+                })
+        }
+        _ => false,
+    }
 }
 
 pub fn broker_socket(xml: &str, domain: &DomainSpec) -> GuardResult<PathBuf> {
@@ -134,102 +359,88 @@ pub fn verify_domain(xml: &str, spec: &DomainSpec) -> GuardResult<()> {
             return Err("unexpected domain boot source".into());
         }
     }
-    let devices = child(domain, "devices").ok_or("missing domain devices")?;
-    let mut root_count = 0;
-    let mut input_count = 0;
-    let mut channel_count = 0;
+    let mut device_lists = children(domain).filter(|node| node.has_tag_name("devices"));
+    let devices = device_lists.next().ok_or("missing domain devices")?;
+    if device_lists.next().is_some() {
+        return Err("duplicate domain devices list".into());
+    }
+    let active = domain.attribute("id").is_some();
+    let mut seen = HashSet::new();
     for device in children(devices) {
         let tag = device.tag_name().name();
-        match tag {
-            "disk" => {
-                let target = child(device, "target");
-                let path = attribute(child(device, "source"), "file");
-                let readonly = child(device, "readonly").is_some();
-                let driver = attribute(child(device, "driver"), "type");
-                if device.attribute("type") != Some("file")
-                    || device.attribute("device") != Some("disk")
-                    || attribute(target, "bus") != Some("virtio")
-                    || children(device).any(|field| {
-                        !matches!(
-                            field.tag_name().name(),
-                            "driver"
-                                | "source"
-                                | "target"
-                                | "readonly"
-                                | "alias"
-                                | "address"
-                                | "backingStore"
-                        )
-                    })
-                {
-                    return Err("unexpected disk configuration".into());
+        let (kind, index) = match tag {
+            "disk" => (
+                verified_disk(device, spec).ok_or("unexpected disk configuration")?,
+                0,
+            ),
+            "controller" => {
+                let kind = device.attribute("type").ok_or("missing controller type")?;
+                let index = device.attribute("index").unwrap_or("0").parse()?;
+                if !verified_controller(device, kind, index, spec.broker) {
+                    return Err("unexpected controller configuration".into());
                 }
-                match attribute(target, "dev") {
-                    Some("vda")
-                        if path == spec.overlay.to_str()
-                            && !readonly
-                            && driver == Some("qcow2")
-                            && child(device, "backingStore").is_some_and(|backing| {
-                                backing.attribute("type") == Some("file")
-                                    && attribute(child(backing, "source"), "file")
-                                        == spec.base.to_str()
-                                    && attribute(child(backing, "format"), "type") == Some("qcow2")
-                                    && child(backing, "backingStore")
-                                        .is_none_or(|next| children(next).next().is_none())
-                            }) =>
-                    {
-                        root_count += 1
-                    }
-                    Some("vdb")
-                        if spec.input.is_some()
-                            && path == spec.input.as_deref().and_then(Path::to_str)
-                            && readonly
-                            && driver == Some("raw") =>
-                    {
-                        input_count += 1
-                    }
-                    _ => return Err("disk failed source, format, or access verification".into()),
-                }
+                (kind, index)
             }
-            "channel"
-                if spec.broker
-                    && device.attribute("type") == Some("unix")
-                    && attribute(child(device, "target"), "type") == Some("virtio")
-                    && attribute(child(device, "target"), "name")
-                        == Some("dev.alethic.guard.1")
-                    && match child(device, "source") {
-                        Some(src) => {
-                            src.attribute("mode") == Some("bind")
-                                && src
-                                    .attribute("path")
-                                    .is_some_and(|path| channel_path(path, domain, spec))
-                        }
-                        None => domain.attribute("id").is_none(),
-                    } =>
+            "channel" if verified_channel(device, domain, spec) => ("", 0),
+            "serial" if verified_pty(device, active) => ("", 0),
+            "console"
+                if verified_pty(device, active)
+                    && pty_path(device) == child(devices, "serial").and_then(pty_path) =>
             {
-                channel_count += 1;
+                ("", 0)
             }
-            "controller" if spec.broker && device.attribute("type") == Some("virtio-serial") => {}
-            "serial" | "console" if device.attribute("type") == Some("pty") => {}
-            "controller"
-                if matches!(device.attribute("type"), Some("pci" | "sata"))
-                    || (device.attribute("type") == Some("usb")
-                        && device.attribute("model") == Some("none")) => {}
-            "input" if device.attribute("bus") == Some("ps2") => {}
-            "audio" if device.attribute("type") == Some("none") => {}
-            "memballoon" if device.attribute("model") == Some("none") => {}
+            "input"
+                if has_shape(device, &["type", "bus"], &["alias"])
+                    && device.attribute("bus") == Some("ps2") =>
+            {
+                match device.attribute("type") {
+                    Some(kind @ ("mouse" | "keyboard")) => (kind, 0),
+                    _ => return Err("unexpected PS/2 input type".into()),
+                }
+            }
+            "audio"
+                if has_shape(device, &["id", "type"], &[])
+                    && device.attribute("id") == Some("1")
+                    && device.attribute("type") == Some("none") =>
+            {
+                ("", 0)
+            }
+            "memballoon"
+                if has_shape(device, &["model"], &[])
+                    && device.attribute("model") == Some("none") =>
+            {
+                ("", 0)
+            }
             "watchdog"
-                if device.attribute("model") == Some("itco")
-                    && device.attribute("action") == Some("poweroff") => {}
-            "emulator" => {}
+                if has_shape(device, &["model", "action"], &["alias"])
+                    && device.attribute("model") == Some("itco")
+                    && device.attribute("action") == Some("poweroff") =>
+            {
+                ("", 0)
+            }
+            "emulator"
+                if device.attributes().len() == 0
+                    && device.children().count() == 1
+                    && device.text() == Some("/usr/bin/qemu-system-x86_64") =>
+            {
+                ("", 0)
+            }
             _ => return Err(format!("unexpected domain device: {tag}").into()),
+        };
+        if !device_metadata(device) {
+            return Err(format!("unexpected alias or address for domain device: {tag}").into());
+        }
+        if !seen.insert((tag, kind, index)) {
+            return Err(format!("duplicate domain device: {tag}").into());
         }
     }
-    if root_count != 1
-        || input_count != usize::from(spec.input.is_some())
-        || channel_count != usize::from(spec.broker)
+    // Generated XML leaves the emulator implicit. Live XML reports its path.
+    if !seen.contains(&("disk", "vda", 0))
+        || seen.contains(&("disk", "vdb", 0)) != spec.input.is_some()
+        || seen.contains(&("channel", "", 0)) != spec.broker
+        || (active && !seen.contains(&("emulator", "", 0)))
     {
-        return Err("missing or duplicate approved disks".into());
+        return Err("missing expected disk, broker channel, or emulator".into());
     }
     Ok(())
 }

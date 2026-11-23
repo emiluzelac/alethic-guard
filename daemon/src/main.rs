@@ -1,12 +1,12 @@
 use alethic_guardd::{
     GuardResult,
-    auth::peer_uid,
+    auth::peer_credentials,
     broker,
     collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest},
     digest_file,
     effect::{Action, Outcome},
     evidence,
-    lifecycle::{Enrolled, Lifecycle, Registry, Workload},
+    lifecycle::{Enrolled, LaunchDisks, Lifecycle, Registry, Workload},
     protocol::{configure, read_frame, write_frame},
     vm::{Libvirt, create_overlay, validate_base_image},
 };
@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     fs::{self, OpenOptions},
-    io,
+    io::{self, Read},
     os::{
         fd::AsRawFd,
         unix::{
@@ -75,6 +75,11 @@ enum Request {
     BrokerFinish {
         nonce: Uuid,
         outcome: Outcome,
+    },
+    ReapGateway {
+        id: Uuid,
+        generation: u64,
+        pid: u32,
     },
     EffectStatus {
         id: Uuid,
@@ -143,44 +148,35 @@ fn approved_file(dir: &Path, name: &str) -> GuardResult<PathBuf> {
 
 impl Config {
     fn policy(&self, profile: &str) -> GuardResult<(String, bool, bool)> {
+        use alethic_guardd::policy::{MAX_POLICY_BYTES, validate_compiled};
+
         let path = approved_file(&self.policies, &format!("{profile}.json"))?;
-        if fs::metadata(&path)?.len() > 65_536 {
-            return Err("policy exceeds maximum size".into());
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o222 != 0 || meta.nlink() != 1 {
+            return Err("installed policy must be an immutable regular file owned by root".into());
         }
-        let plan: Value = serde_json::from_slice(&fs::read(&path)?)?;
-        let spec = &plan["spec"];
-        if plan["api_version"] != "guard.alethic.dev/v1"
-            || plan["kind"] != "WorkloadPolicy"
-            || plan["metadata"]["name"] != profile
-            || spec["isolation"] != "vm-isolated"
-            || spec["enforce"] != true
-            || spec["default_action"] != "deny"
-            || spec["network"]["guest_direct_egress"] != "deny_all"
-        {
-            return Err("expected a compiled, fail-closed v1 policy".into());
-        }
-        let endpoints = spec["network"]["approved_broker_destinations"]
-            .as_array()
-            .ok_or("missing broker destinations")?;
-        let broker = match spec["profile"].as_str() {
-            Some("offline-strict") if endpoints.is_empty() => false,
-            Some("allowlisted-api") if endpoints.len() == 1 => {
-                let config = self
-                    .collector
-                    .as_ref()
-                    .ok_or("mediated API is disabled on host")?;
-                if endpoints[0] != config.target {
-                    return Err("collector policy differs from host target".into());
-                }
-                Collector::parse_url(&config.target)?;
-                true
+        let mut document = Vec::new();
+        file.take((MAX_POLICY_BYTES + 1) as u64)
+            .read_to_end(&mut document)?;
+        let policy = validate_compiled(&document, profile)?;
+        if let Some(target) = &policy.collector_target {
+            let config = self
+                .collector
+                .as_ref()
+                .ok_or("mediated API is disabled on host")?;
+            if target != &config.target {
+                return Err("collector policy differs from host target".into());
             }
-            _ => return Err("unsupported profile or invalid destination policy".into()),
-        };
-        let inputs = spec["filesystem"]["inputs"]
-            .as_array()
-            .ok_or("missing input volume policy")?;
-        Ok((digest_file(&path)?, !inputs.is_empty(), broker))
+        }
+        Ok((
+            policy.digest,
+            policy.has_input,
+            policy.collector_target.is_some(),
+        ))
     }
 
     fn validate_enrolled(&self, row: &Workload) -> GuardResult<()> {
@@ -212,14 +208,51 @@ impl Config {
         validate_base_image(&a.image)
     }
 
-    fn overlay(&self, row: &Workload) -> GuardResult<PathBuf> {
+    fn overlay(&self, row: &Workload) -> GuardResult<LaunchDisks> {
+        use alethic_guardd::artifact::pin_file;
+
         self.validate_enrolled(row)?;
-        let path = self
-            .data
-            .join("run")
-            .join(format!("{}-{}.qcow2", row.enrollment.id, row.generation));
-        create_overlay(&path, &row.enrollment.image)?;
-        Ok(path)
+        let run = self.data.join("run");
+        let artifacts = run.join("artifacts");
+        match fs::create_dir(&artifacts) {
+            Ok(()) => fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o755))?,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        secure_directory(&artifacts)?;
+        let stage = |source: &Path, digest: &str, extension: &str| -> GuardResult<PathBuf> {
+            let key = digest
+                .strip_prefix("sha256:")
+                .ok_or("invalid registered image digest")?;
+            if key.len() != 64 || !key.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("invalid registered image digest".into());
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(source)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o222 != 0 {
+                return Err("launch source is no longer an approved artifact".into());
+            }
+            let destination = artifacts.join(format!("{key}.{extension}"));
+            pin_file(file, &destination, digest)?;
+            Ok(destination)
+        };
+        let base = stage(&row.enrollment.image, &row.enrollment.image_digest, "qcow2")?;
+        validate_base_image(&base)?;
+        let input = match (&row.enrollment.input, &row.enrollment.input_digest) {
+            (None, None) => None,
+            (Some(source), Some(digest)) => Some(stage(source, digest, "raw")?),
+            _ => return Err("incomplete input provenance".into()),
+        };
+        let overlay = run.join(format!("{}-{}.qcow2", row.enrollment.id, row.generation));
+        create_overlay(&overlay, &base)?;
+        Ok(LaunchDisks {
+            overlay,
+            base,
+            input,
+        })
     }
 }
 
@@ -238,6 +271,12 @@ fn broker_request(
     let (digest, _, mediated) = config.policy(&item.enrollment.profile)?;
     if !mediated || digest != item.enrollment.policy_digest {
         return Err("the installed policy changed".into());
+    }
+    if matches!(
+        req,
+        Request::BrokerPrepare { .. } | Request::BrokerRedeem { .. } | Request::BrokerCheck { .. }
+    ) {
+        Lifecycle::new(registry, &Libvirt).require_running_boundary(binding.id)?;
     }
     match req {
         Request::BrokerPrepare { request } => {
@@ -278,10 +317,32 @@ fn attach_gateway(registry: &mut Registry, config: &Config, item: &Workload) -> 
     let collector = config.collector.as_ref().ok_or("gateway disabled")?;
     match broker::start(registry, item, collector, &config.socket) {
         Ok(mut child) => {
-            thread::spawn(move || {
-                if let Err(error) = child.wait() {
-                    eprintln!("gateway wait failed: {error}");
+            if let Err(error) = registry.bind_gateway_process(item, child.id()) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = Lifecycle::new(registry, &Libvirt).contain(item.enrollment.id, true);
+                return Err(error);
+            }
+            let socket = config.socket.clone();
+            let id = item.enrollment.id;
+            let generation = item.generation;
+            let pid = child.id();
+            thread::spawn(move || match child.wait() {
+                Ok(_) => {
+                    let notify = (|| -> GuardResult<()> {
+                        let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+                        configure(&stream)?;
+                        write_frame(
+                            &mut stream,
+                            &json!({"command":"reap_gateway","id":id,"generation":generation,"pid":pid}),
+                        )?;
+                        Ok(())
+                    })();
+                    if let Err(error) = notify {
+                        eprintln!("gateway exit notification failed: {error}");
+                    }
                 }
+                Err(error) => eprintln!("gateway wait failed: {error}"),
             });
             Ok(())
         }
@@ -355,6 +416,7 @@ fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> G
                 let _ = Lifecycle::new(registry, &vm).contain(id, true);
                 return Err(error);
             }
+            registry.recover_workload_effects(Some(id))?;
             (json!(row), Some((id, "WORKLOAD_PAUSED", "VERIFIED")))
         }
         Request::Resume { id } => {
@@ -397,6 +459,19 @@ fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> G
                 Some((id, "WORKLOAD_RELEASED", "VERIFIED")),
             )
         }
+        Request::ReapGateway {
+            id,
+            generation,
+            pid,
+        } => {
+            if registry.has_active_gateway_process(id, generation, pid)? {
+                let report = Lifecycle::new(registry, &vm).contain(id, false)?;
+                let status = report.broker_cutoff.as_str();
+                (json!(report), Some((id, "GATEWAY_EXIT_OBSERVED", status)))
+            } else {
+                (json!({}), None)
+            }
+        }
         Request::EffectStatus { id, request } => (registry.effect_status(id, request)?, None),
         Request::ReconcileReceipt {
             id,
@@ -434,11 +509,13 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
     }
     let config: CollectorConfig = serde_json::from_slice(&fs::read(path)?)?;
     let binary = &config.gateway;
-    if !binary.is_absolute()
-        || !binary.is_file()
-        || fs::metadata(binary)?.uid() != 0
-        || fs::metadata(binary)?.mode() & 0o022 != 0
-    {
+    secure_directory(
+        binary
+            .parent()
+            .ok_or("gateway executable requires a protected parent")?,
+    )?;
+    let meta = fs::symlink_metadata(binary)?;
+    if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {
         return Err("gateway executable must be trusted host software".into());
     }
     if !config.controller_socket.is_absolute()
@@ -448,6 +525,13 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
             .is_some_and(|path| !path.is_absolute())
     {
         return Err("expected absolute controller socket and CA paths".into());
+    }
+    if let Some(ca) = &config.ca_file {
+        let file = ca
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("invalid CA filename")?;
+        approved_file(ca.parent().ok_or("missing CA file parent")?, file)?;
     }
     let collector = Collector::parse_url(&config.target)?;
     collector.resolve(&config.addresses)?;
@@ -515,12 +599,13 @@ fn serve(config: Config) -> GuardResult<()> {
     for stream in listener.incoming() {
         let mut stream = stream?;
         let request = configure(&stream).and_then(|_| {
-            let uid = peer_uid(&stream)?;
-            if uid != 0 {
-                registry.gateway_by_uid(uid)?;
+            let peer = peer_credentials(&stream)?;
+            if peer.uid != 0 {
+                let binding = registry.gateway_by_uid(peer.uid)?;
+                registry.require_gateway_process(binding, peer)?;
             }
             let request = read_frame(&stream)?;
-            handle(request, &mut registry, &config, uid)
+            handle(request, &mut registry, &config, peer.uid)
         });
         let envelope = match request {
             Ok(result) => json!({"ok": true, "result": result}),

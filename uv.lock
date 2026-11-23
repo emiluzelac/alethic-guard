@@ -12,17 +12,30 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+controller = [
+    { name = "alethic-kernel" },
+]
 test = [
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "alethic-kernel", marker = "extra == 'controller'", specifier = "==0.4.0" },
     { name = "jsonschema", specifier = ">=4.23,<5" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
     { name = "pyyaml", specifier = ">=6,<7" },
 ]
-provides-extras = ["test"]
+provides-extras = ["controller", "test"]
+
+[[package]]
+name = "alethic-kernel"
+version = "0.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0b/d3/24d885c6eae7a21c924f564cc72eab6a01b49ab501eab82048079536e349/alethic_kernel-0.4.0.tar.gz", hash = "sha256:33090345cd9341f2b33848e6d22d16afa2a2d3330bb7485cf38830d3585c44ff", size = 197029, upload-time = "2026-11-23T03:14:57.567Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/24/ad/5c907c54c7ac21ec4893992c5590a165d51c063c1db3d203fd7e03015f83/alethic_kernel-0.4.0-py3-none-any.whl", hash = "sha256:34b9bcc3d4efd05721be934f060d26aea55cabdaea8073eeb239acf90e2567be", size = 32361, upload-time = "2026-11-23T03:14:56.614Z" },
+]
 
 [[package]]
 name = "attrs"

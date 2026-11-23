@@ -24,8 +24,7 @@ jobs:
           git checkout -q --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$COMMIT"
       - run: python -m pip install uv==0.12.9
-      - run: scripts/build-kernel-wheel
-      - run: uv run --locked --python ${{ matrix.python }} --extra test --with .wheels/alethic_kernel-0.4.0-py3-none-any.whl python -m pytest
+      - run: uv run --locked --python ${{ matrix.python }} --extra controller --extra test python -m pytest
       - run: uv run --locked alethic-guard profile validate policy/examples/offline-research.yaml
 
   rust:

@@ -11,10 +11,9 @@ See the [deployment instructions](docs/DEPLOY_LINUX.md), [threat model](docs/THR
 Install Python 3.11 or later, uv, and Rust for Linux.
 
 ```sh
-scripts/build-kernel-wheel
-uv run --locked --extra test --with .wheels/alethic_kernel-0.4.0-py3-none-any.whl python -m pytest
+uv run --locked --extra controller --extra test python -m pytest
 cargo test --manifest-path daemon/Cargo.toml --locked
 cargo test --manifest-path gateway/Cargo.toml --locked
 ```
 
-The adapter is developed against a wheel from an exact public kernel commit. [Release qualification](docs/TEST_PLAN.md) covers the candidate package and the measured runtime configuration.
+The optional controller dependency pins the published `alethic-kernel==0.4.0` wheel. [Release qualification](docs/TEST_PLAN.md) covers the installed package and the measured runtime configuration.

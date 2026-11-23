@@ -57,17 +57,34 @@ pub struct Workload {
     pub epoch: u64,
     pub generation: u64,
     pub overlay: Option<PathBuf>,
+    #[serde(default)]
+    pub runtime_base: Option<PathBuf>,
+    #[serde(default)]
+    pub runtime_input: Option<PathBuf>,
     pub terminating: bool,
+}
+
+pub struct LaunchDisks {
+    pub overlay: PathBuf,
+    pub base: PathBuf,
+    pub input: Option<PathBuf>,
 }
 
 impl Workload {
     pub fn domain(&self) -> GuardResult<DomainSpec> {
         Ok(DomainSpec {
             id: self.enrollment.id,
-            base: self.enrollment.image.clone(),
+            base: self
+                .runtime_base
+                .clone()
+                .unwrap_or_else(|| self.enrollment.image.clone()),
             broker: self.enrollment.broker,
             overlay: self.overlay.clone().ok_or("missing runtime overlay")?,
-            input: self.enrollment.input.clone(),
+            input: if self.runtime_base.is_some() {
+                self.runtime_input.clone()
+            } else {
+                self.enrollment.input.clone()
+            },
         })
     }
 
@@ -112,6 +129,7 @@ impl Registry {
         )?;
         crate::effect::initialize(&conn)?;
         crate::broker::initialize(&conn)?;
+        crate::gateway_process::initialize(&conn)?;
         Ok(Self { conn })
     }
 
@@ -122,6 +140,8 @@ impl Registry {
             epoch: 0,
             generation: 0,
             overlay: None,
+            runtime_base: None,
+            runtime_input: None,
             terminating: false,
         };
         self.conn.execute(
@@ -197,7 +217,7 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     pub fn start(
         &mut self,
         id: Uuid,
-        provision: impl FnOnce(&Workload) -> GuardResult<PathBuf>,
+        provision: impl FnOnce(&Workload) -> GuardResult<LaunchDisks>,
     ) -> GuardResult<Workload> {
         let mut item = self.known(id)?;
         if item.mode != Mode::Ready || !self.vm.verify_absent(id)? {
@@ -210,7 +230,10 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         item.mode = Mode::Starting;
         self.registry.save(&item)?;
         let start = (|| {
-            item.overlay = Some(provision(&item)?);
+            let disks = provision(&item)?;
+            item.overlay = Some(disks.overlay);
+            item.runtime_base = Some(disks.base);
+            item.runtime_input = disks.input;
             self.registry.save(&item)?;
             self.vm.create_paused(&item.domain()?)?;
             if self.vm.state(id)? != VmState::Paused {
@@ -229,7 +252,9 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
             // when startup reached only part of the hypervisor operation.
             let report = self.contain(id, true);
             if let Ok(mut report) = report {
-                if report.shutdown == Observation::Verified {
+                if report.shutdown == Observation::Verified
+                    && report.broker_cutoff == Observation::Verified
+                {
                     item = self.known(id)?;
                     item.mode = Mode::Contained;
                     self.registry.save(&item)?;
@@ -244,24 +269,39 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         Ok(item)
     }
 
+    fn observe_guest(&self, item: &Workload) -> Observation {
+        let id = item.enrollment.id;
+        match self.vm.state(id) {
+            Ok(VmState::Absent) => match self.vm.verify_absent(id) {
+                Ok(true) => Observation::Verified,
+                Ok(false) => Observation::Failed,
+                Err(_) => Observation::Unknown,
+            },
+            Ok(_) if self.verify_active(item).is_ok() => Observation::Verified,
+            Ok(_) => Observation::Failed,
+            Err(_) => Observation::Unknown,
+        }
+    }
+
     pub fn verify(&mut self, id: Uuid) -> GuardResult<Observation> {
         let item = self.known(id)?;
-        match self.vm.state(id) {
-            Ok(VmState::Absent) => Ok(if self.vm.verify_absent(id)? {
-                Observation::Verified
-            } else {
-                Observation::Failed
-            }),
-            Ok(_) => {
-                if self.verify_active(&item).is_ok() {
-                    Ok(Observation::Verified)
-                } else {
-                    self.contain(id, true)?;
-                    Ok(Observation::Failed)
-                }
-            }
-            Err(_) => Ok(Observation::Unknown),
+        let observed = self.observe_guest(&item);
+        if observed != Observation::Verified {
+            self.contain(id, true)?;
         }
+        Ok(observed)
+    }
+
+    pub fn require_running_boundary(&mut self, id: Uuid) -> GuardResult<()> {
+        let item = self.known(id)?;
+        if item.mode != Mode::Running {
+            return Err("workload is not admitted".into());
+        }
+        if self.vm.state(id).ok() != Some(VmState::Running) || self.verify_active(&item).is_err() {
+            self.contain(id, true)?;
+            return Err("live guest boundary could not be verified".into());
+        }
+        Ok(())
     }
 
     pub fn pause(&mut self, id: Uuid) -> GuardResult<Workload> {
@@ -298,19 +338,13 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
 
     pub fn contain(&mut self, id: Uuid, terminate: bool) -> GuardResult<ContainmentReport> {
         let mut item = self.known(id)?;
-        let guest_network = match self.vm.state(id) {
-            Ok(VmState::Absent) => Observation::Verified,
-            Ok(_) if self.verify_active(&item).is_ok() => Observation::Verified,
-            Ok(_) => Observation::Failed,
-            Err(_) => Observation::Unknown,
-        };
         if !matches!(
             item.mode,
             Mode::Containing | Mode::Contained | Mode::Terminated
         ) {
             item.revoke()?;
         }
-        item.terminating |= terminate || guest_network != Observation::Verified;
+        item.terminating |= terminate;
         item.mode = Mode::Containing;
         let persisted = self.registry.save(&item);
         // Attempt the host network cutoff even if the lifecycle write failed.
@@ -322,6 +356,9 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
                 Observation::Unknown
             }
         };
+        // Fence admissions and cut off the broker before waiting for libvirt.
+        let guest_network = self.observe_guest(&item);
+        item.terminating |= guest_network != Observation::Verified;
         let mut shutdown = Observation::Unknown;
         if item.terminating || persisted.is_err() || self.vm.state(id).ok() == Some(VmState::Absent)
         {
@@ -368,6 +405,8 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         }
         item.mode = Mode::Ready;
         item.overlay = None;
+        item.runtime_base = None;
+        item.runtime_input = None;
         item.terminating = false;
         self.registry.save(&item)?;
         Ok(item)

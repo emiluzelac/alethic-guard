@@ -1,4 +1,4 @@
-use alethic_guardd::lifecycle::{Enrolled, Lifecycle, Mode, Observation, Registry};
+use alethic_guardd::lifecycle::{Enrolled, LaunchDisks, Lifecycle, Mode, Observation, Registry};
 use alethic_guardd::{
     GuardResult,
     vm::{DomainSpec, Hypervisor, VmState},
@@ -16,6 +16,7 @@ struct FakeVm {
     xml: RefCell<String>,
     drift: Cell<bool>,
     offline: Cell<bool>,
+    orphan: Cell<bool>,
     persistent: Cell<bool>,
     resume_calls: Cell<u32>,
 }
@@ -44,6 +45,10 @@ impl Hypervisor for FakeVm {
             Ok(self.state.get().unwrap_or(VmState::Absent))
         }
     }
+    fn verify_absent(&self, id: Uuid) -> GuardResult<bool> {
+        Ok(self.state(id)? == VmState::Absent && !self.orphan.get())
+    }
+
     fn suspend(&self, _: Uuid) -> GuardResult<()> {
         self.state.set(Some(VmState::Paused));
         Ok(())
@@ -72,8 +77,12 @@ fn enrolled() -> Enrolled {
     }
 }
 
-fn overlay() -> PathBuf {
-    "/test/private.qcow2".into()
+fn launch(row: &alethic_guardd::lifecycle::Workload) -> GuardResult<LaunchDisks> {
+    Ok(LaunchDisks {
+        overlay: "/test/private.qcow2".into(),
+        base: row.enrollment.image.clone(),
+        input: None,
+    })
 }
 
 #[test]
@@ -94,7 +103,7 @@ fn test_active_drift_or_persistent_domain_never_unpauses() {
         let item = enrolled();
         registry.enroll(&item).unwrap();
         let mut life = Lifecycle::new(&mut registry, &vm);
-        assert!(life.start(item.id, |_| Ok(overlay())).is_err());
+        assert!(life.start(item.id, launch).is_err());
         assert_eq!(vm.resume_calls.get(), 0);
         assert_eq!(vm.state(item.id).unwrap(), VmState::Absent);
         assert_eq!(life.status(item.id).unwrap().unwrap().mode, Mode::Contained);
@@ -108,13 +117,13 @@ fn test_contain_rejects_start_until_release() {
     let item = enrolled();
     registry.enroll(&item).unwrap();
     let mut life = Lifecycle::new(&mut registry, &vm);
-    let initial = life.start(item.id, |_| Ok(overlay())).unwrap();
+    let initial = life.start(item.id, launch).unwrap();
     let report = life.contain(item.id, false).unwrap();
     assert_eq!(report.guest_network, Observation::Verified);
-    assert!(life.start(item.id, |_| Ok(overlay())).is_err());
+    assert!(life.start(item.id, launch).is_err());
     life.contain(item.id, true).unwrap();
     life.release(item.id).unwrap();
-    let again = life.start(item.id, |_| Ok(overlay())).unwrap();
+    let again = life.start(item.id, launch).unwrap();
     assert!(again.generation > initial.generation);
     assert!(again.epoch > initial.epoch);
 }
@@ -126,7 +135,7 @@ fn test_failed_hypervisor_observation_is_unknown() {
     let item = enrolled();
     registry.enroll(&item).unwrap();
     let mut life = Lifecycle::new(&mut registry, &vm);
-    life.start(item.id, |_| Ok(overlay())).unwrap();
+    life.start(item.id, launch).unwrap();
     vm.offline.set(true);
     let report = life.contain(item.id, true).unwrap();
     assert_eq!(report.shutdown, Observation::Unknown);
@@ -145,7 +154,7 @@ fn test_reboot_recovers_running_without_autostart() {
         let mut registry = Registry::open(&path).unwrap();
         registry.enroll(&item).unwrap();
         Lifecycle::new(&mut registry, &FakeVm::default())
-            .start(item.id, |_| Ok(overlay()))
+            .start(item.id, launch)
             .unwrap();
     }
     let vm = FakeVm::default();
@@ -157,5 +166,39 @@ fn test_reboot_recovers_running_without_autostart() {
         Mode::Terminated
     );
     assert_eq!(vm.resume_calls.get(), 0);
-    assert!(life.start(item.id, |_| Ok(overlay())).is_err());
+    assert!(life.start(item.id, launch).is_err());
+}
+
+#[test]
+fn test_libvirt_absence_alone_does_not_verify_containment() {
+    let mut registry = Registry::memory().unwrap();
+    let vm = FakeVm::default();
+    let item = enrolled();
+    registry.enroll(&item).unwrap();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(item.id, launch).unwrap();
+    vm.state.set(Some(VmState::Absent));
+    vm.orphan.set(true);
+
+    let report = lifecycle.contain(item.id, false).unwrap();
+    assert_eq!(report.guest_network, Observation::Failed);
+    assert_eq!(report.shutdown, Observation::Failed);
+    assert_eq!(report.mode, Mode::Containing);
+    assert!(lifecycle.release(item.id).is_err());
+}
+
+#[test]
+fn test_observer_failure_fences_a_running_workload() {
+    let mut registry = Registry::memory().unwrap();
+    let vm = FakeVm::default();
+    let item = enrolled();
+    registry.enroll(&item).unwrap();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(item.id, launch).unwrap();
+    vm.offline.set(true);
+
+    assert_eq!(lifecycle.verify(item.id).unwrap(), Observation::Unknown);
+    let row = lifecycle.status(item.id).unwrap().unwrap();
+    assert_eq!(row.mode, Mode::Containing);
+    assert_eq!(row.epoch, 1);
 }

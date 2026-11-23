@@ -10,6 +10,7 @@ description = "Host-enforced execution controls for enrolled Alethic workloads"
 dependencies = ["PyYAML>=6,<7", "jsonschema>=4.23,<5"]
 
 [project.optional-dependencies]
+controller = ["alethic-kernel==0.4.0"]
 test = ["pytest>=8,<10"]
 
 [project.scripts]

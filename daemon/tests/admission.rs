@@ -1,7 +1,7 @@
 use alethic_guardd::{
     GuardResult,
     effect::{Action, Governance, Outcome},
-    lifecycle::{Enrolled, Lifecycle, Registry},
+    lifecycle::{Enrolled, LaunchDisks, Lifecycle, Registry},
     vm::{DomainSpec, Hypervisor, VmState},
 };
 use std::{cell::Cell, path::PathBuf};
@@ -57,7 +57,13 @@ fn setup_with(mut registry: Registry) -> (Registry, LabVm, Action, Governance) {
     };
     registry.enroll(&enrolled).unwrap();
     let running = Lifecycle::new(&mut registry, &vm)
-        .start(workload_id, |_| Ok("/test/overlay.qcow2".into()))
+        .start(workload_id, |row| {
+            Ok(LaunchDisks {
+                overlay: "/test/overlay.qcow2".into(),
+                base: row.enrollment.image.clone(),
+                input: None,
+            })
+        })
         .unwrap();
     let action = Action {
         workload_id,
