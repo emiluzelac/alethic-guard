@@ -324,7 +324,7 @@ impl Sandbox {
         Ok(())
     }
 
-    pub fn create(self) -> GuardResult<()> {
+    pub fn create(self, raise_link: impl FnOnce() -> GuardResult<()>) -> GuardResult<()> {
         self.ensure_clean()?;
         self.install(&[], 0)?;
         let ns = self.namespace();
@@ -338,7 +338,7 @@ impl Sandbox {
             ],
             None,
         )?;
-        invoke(IP, &["link", "set", &host, "up"], None)?;
+        raise_link()?;
         invoke(IP, &["-n", &ns, "link", "set", &peer, "up"], None)?;
         let [b, c] = (self.slot * 4).to_be_bytes();
         let gw4 = format!("10.254.{b}.{}", c + 1);
@@ -376,6 +376,11 @@ impl Sandbox {
                 None,
             )?;
         }
+        Ok(())
+    }
+
+    pub fn raise_link(self) -> GuardResult<()> {
+        invoke(IP, &["link", "set", &self.host_link(), "up"], None)?;
         Ok(())
     }
 

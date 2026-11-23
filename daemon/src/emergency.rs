@@ -182,15 +182,30 @@ impl Fences {
         {
             return Err("a newer emergency cutoff interrupted release".into());
         }
-        match fs::remove_file(self.marker(id)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        File::open(&self.root)?.sync_all()?;
+        // Claim this release before removing its marker. A cutoff that wins the
+        // generation race leaves the existing durable marker in place.
         gate.generation
             .compare_exchange(version, released, Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| "a newer emergency cutoff interrupted release")?;
+        let durable = (|| -> io::Result<()> {
+            let directory = File::open(&self.root)?;
+            match fs::remove_file(self.marker(id)) {
+                Ok(()) => directory.sync_all(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })();
+        if let Err(error) = durable {
+            // Leave the workload fenced on storage failure unless a newer
+            // cutoff has already fenced it.
+            let _ = gate.generation.compare_exchange(
+                released,
+                version,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            return Err(error.into());
+        }
         Ok(result)
     }
 }

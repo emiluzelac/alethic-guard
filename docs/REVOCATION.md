@@ -10,4 +10,6 @@ Terminate applies containment and asks the hypervisor to stop the VM. Guard chec
 
 A gateway rechecks authority before opening the TLS connection and before writing the authorized request. The revocation barrier is the verified host cutoff after fencing. Data already past that boundary may reach the collector. Use the emergency response for the host network observation and the normal containment or termination response for the hypervisor observation.
 
+An effect journal entry records the durable redemption transaction. A transaction already underway can commit while cutoff installs the host deny. Guard checks the fence again before returning transport authority, and the host network cutoff covers a request that already had authority.
+
 Crash recovery changes any incomplete admitted effect to `OUTCOME_UNKNOWN`. Use `workload effect-status ID --request REQUEST_ID` to obtain the collector idempotency key. Retrieve the matching receipt over the collector's independently authorized operator channel, then use `workload reconcile-receipt ID --request REQUEST_ID --receipt RECEIPT.json`. The daemon checks that the trusted operator's receipt matches the exact admitted key and payload digest. A missing response remains unknown.

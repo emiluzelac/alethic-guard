@@ -253,7 +253,7 @@ pub fn start(
     let sandbox = binding.sandbox()?;
     // Publish the link identity before creating any network objects.
     fences.bind(binding.id, sandbox)?;
-    sandbox.create()?;
+    sandbox.create(|| fences.enable(binding.id, || sandbox.raise_link()))?;
     let xml = Libvirt.active_xml(row.enrollment.id)?;
     let path = broker_socket(&xml, &row.domain()?)?;
     let channel = UnixStream::connect(path)?;

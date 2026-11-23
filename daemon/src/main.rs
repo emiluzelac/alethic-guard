@@ -482,9 +482,13 @@ fn handle(
             )
         }
         Request::Release { id } => {
-            config.validate_enrolled(&lifecycle.status(id)?.ok_or("unmanaged workload")?)?;
+            lifecycle.status(id)?.ok_or("unmanaged workload")?;
             (
-                json!(fences.release(id, |latched| lifecycle.release_latched(id, latched))?),
+                json!(fences.release(id, |latched| {
+                    config
+                        .validate_enrolled(&lifecycle.status(id)?.ok_or("unmanaged workload")?)?;
+                    lifecycle.release_latched(id, latched)
+                })?),
                 Some((id, "WORKLOAD_RELEASED", "VERIFIED")),
             )
         }

@@ -69,6 +69,21 @@ def daemon_reading_image(pid):
     return False
 
 
+def verify_release_race(output, workload, daemon_pid):
+    with subprocess.Popen(operator("release", workload), stderr=subprocess.PIPE, text=True) as release:
+        until(lambda: daemon_reading_image(daemon_pid), 5, "ordinary release hashing")
+        cutoff = record(output, "release-race-cutoff", call("cutoff", workload, emergency=True))
+        assert cutoff["broker_cutoff"] == cutoff["admissions"] == "VERIFIED", cutoff
+        assert release.poll() is None and daemon_reading_image(daemon_pid), "release completed before cutoff"
+        _, error = release.communicate(timeout=120)
+        (output / "release-race-refused.txt").write_text(error)
+        assert release.returncode and "newer emergency cutoff" in error, error
+    start = subprocess.run(operator("start", workload), capture_output=True, text=True)
+    assert start.returncode and "cutoff is latched" in start.stderr, start.stderr
+    released = record(output, "explicit-release", call("release", workload))
+    assert released["mode"] == "READY", released
+
+
 def qualify(args):
     output = args.output.absolute()
     receipts = output / "receipts"
@@ -126,6 +141,7 @@ table inet {table} {{
         })
         assert cutoff["broker_cutoff"] == cutoff["admissions"] == "VERIFIED", cutoff
         assert 0 < cutoff["observed_at_unix_ns"] - ready_at < 3_000_000_000, cutoff
+        assert elapsed < 3, f"cutoff acknowledgment took {elapsed:.3f} seconds"
         if backlog is not None:
             assert pending and daemon_reading_image(args.daemon_pid), "ordinary hashing completed before cutoff"
         barrier.with_suffix(".continue").touch()
@@ -157,6 +173,8 @@ table inet {table} {{
         events = record(output, "evidence", call("evidence_page", {**workload, "after": 0}))
         assert events["events"], "empty evidence export"
         stop(capture, signal.SIGINT)
+        assert capture.returncode == 0, (output / "tcpdump.log").read_text()
+        assert re.search(r"^0 packets dropped by kernel$", (output / "tcpdump.log").read_text(), re.M)
         observed = json.loads(subprocess.check_output(["nft", "-j", "list", "table", "inet", table]))
         record(output, "host-output", observed)
         local_resets = next(
@@ -175,6 +193,9 @@ table inet {table} {{
     record(output, "packet-counts", {"before_cutoff": pre, "at_or_after_cutoff": post, "host_resets": local_resets})
     assert pre and not post, (pre, post)
     print(f"{args.phase}: {pre} forwarded packets before cutoff, {post} after, {len(receipt_files)} receipts")
+    if args.phase == "handshake":
+        verify_release_race(output, workload, args.daemon_pid)
+        print("A release already hashing its image could not erase the newer cutoff")
 
 
 if __name__ == "__main__":
