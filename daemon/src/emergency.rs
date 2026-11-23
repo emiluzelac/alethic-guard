@@ -204,7 +204,8 @@ impl Fences {
         } else {
             Observation::Verified
         };
-        let shutdown = if let Some(_guest) = guest {
+        // Keep the transition guard through both observation timestamps.
+        let shutdown = if guest.is_some() {
             match stop() {
                 Ok(true) => Observation::Verified,
                 Ok(false) => Observation::Failed,

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import re
 import signal
+import socket
 import ssl
 import subprocess
 import sys
@@ -198,19 +199,40 @@ def main(output):
         save("direct-network-observation", {"calibration_syns": 1, "guest_syns": syns - 1})
         stop(sink)
 
-        with subprocess.Popen(ordinary("create", FIXTURE), stdout=subprocess.PIPE, text=True) as pending:
+        with (
+            subprocess.Popen(ordinary("create", FIXTURE), stdout=subprocess.PIPE, text=True) as pending,
+            socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as queued,
+        ):
             until(lambda: process_reading(daemon.pid), "ordinary enrollment hashing the lab image")
+            queued.settimeout(80)
+            queued.connect(str(SOCKET))
+            queued.sendall(json.dumps({"command": "status", "id": id}).encode() + b"\n")
             begin = time.monotonic()
             ended = save("emergency-termination", call(*workload("emergency-terminate", id)))
             elapsed = time.monotonic() - begin
             still_pending = pending.poll() is None
-            save("emergency-timing", {"elapsed_seconds": elapsed, "ordinary_request_pending": still_pending})
+            queued.setblocking(False)
+            try:
+                queued.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                status_queued = True
+            else:
+                status_queued = False
+            finally:
+                queued.settimeout(80)
+            save("emergency-timing", {
+                "elapsed_seconds": elapsed,
+                "ordinary_request_pending": still_pending,
+                "ordinary_status_queued": status_queued,
+            })
             assert ended["admissions"] == ended["broker_cutoff"] == ended["shutdown"] == "VERIFIED", ended
-            assert still_pending and elapsed < 5, "emergency operation waited on the ordinary queue"
+            assert still_pending and status_queued and elapsed < 5, "ordinary operator ordering differs"
             assert not qemu_pids(id)
             assert id not in subprocess.check_output(["virsh", "list", "--all", "--uuid"], text=True).split()
             pending.communicate(timeout=80)
             assert pending.returncode == 0
+            with queued.makefile("rb") as incoming:
+                assert json.loads(incoming.readline(65_537))["ok"] is True
 
         libvirt_pid = int(subprocess.check_output(["pgrep", "-x", "libvirtd"], text=True).strip())
         subprocess.run(["kill", "-STOP", str(libvirt_pid)], check=True)
@@ -221,11 +243,14 @@ def main(output):
         finally:
             subprocess.run(["kill", "-CONT", str(libvirt_pid)], check=True)
 
-        durable = save("cleanup", call(*workload("terminate", id)))
-        assert durable["shutdown"] == durable["broker_cutoff"] == "VERIFIED"
+        # Check the emergency fence before normal cleanup can set it again.
         blocked = subprocess.run(workload("start", id), capture_output=True, text=True, timeout=5)
         assert blocked.returncode and "cutoff is latched" in blocked.stderr, blocked.stderr
         (output / "restart-refused.txt").write_text(blocked.stderr)
+        durable = save("cleanup", call(*workload("terminate", id)))
+        assert durable["shutdown"] == durable["broker_cutoff"] == "VERIFIED"
+        absent = save("already-absent", call(*workload("emergency-terminate", id)))
+        assert absent["shutdown"] == "VERIFIED"
         save("released", call(*workload("release", id)))
         events = output / "events.jsonl"
         head = output / "head.json"
@@ -236,6 +261,7 @@ def main(output):
 
 
 if __name__ == "__main__":
-    if subprocess.check_output(["ip", "-6", "route", "show", "default"], text=True):
+    if any(subprocess.check_output(["ip", family, "route", "show", "default"], text=True)
+           for family in ("-4", "-6")):
         raise SystemExit("local model qualification requires private lab networking")
     main(Path(sys.argv[1]).absolute())

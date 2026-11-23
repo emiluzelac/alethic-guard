@@ -280,3 +280,30 @@ fn an_admission_fence_closed_while_paused_prevents_vm_resume() {
     assert_eq!(vm.resume_calls.get(), 0);
     assert_eq!(vm.state(item.id).unwrap(), VmState::Absent);
 }
+
+#[test]
+fn an_admission_fence_closed_during_resume_requires_verified_cleanup() {
+    let mut registry = Registry::memory().unwrap();
+    let vm = FakeVm::default();
+    let item = enrolled();
+    registry.enroll(&item).unwrap();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    let result = lifecycle.start_guarded(item.id, launch, || {
+        if vm.state(item.id)? == VmState::Running {
+            return Err("emergency fence closed during resume".into());
+        }
+        Ok(())
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup: Verified")
+    );
+    assert_eq!(vm.resume_calls.get(), 1);
+    assert_eq!(vm.state(item.id).unwrap(), VmState::Absent);
+    assert_eq!(
+        lifecycle.status(item.id).unwrap().unwrap().mode,
+        Mode::Contained
+    );
+}

@@ -4,7 +4,7 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "alethic-guard"
-version = "0.3.0rc1"
+version = "0.3.0rc2"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
