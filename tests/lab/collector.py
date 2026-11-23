@@ -14,7 +14,17 @@ import uuid
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def trace(self):
+        if self.server.trace:
+            with self.server.trace.open("a") as output:
+                output.write(json.dumps({"method": self.command, "path": self.path}) + "\n")
+
+    def do_GET(self):
+        self.trace()
+        self.send_error(404)
+
     def do_POST(self):
+        self.trace()
         if self.path != "/v1/fixture":
             self.send_error(404)
             return
@@ -30,6 +40,13 @@ class Handler(BaseHTTPRequestHandler):
         if data != b'{"kind":"alethic-guard-synthetic","value":1}':
             self.send_error(422)
             return
+        if self.server.response == "redirect":
+            self.send_response(307)
+            self.send_header("Location", "/v1/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
         digest = hashlib.sha256(data).hexdigest()
         result = {"idempotency_key": key, "payload_sha256": digest}
         receipt = self.server.receipts / f"{key}.json"
@@ -43,6 +60,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             code = 200
         self.server.pause_at("receipt")
+        if self.server.response == "disconnect":
+            self.close_connection = True
+            return
         encoded = json.dumps(result).encode()
         self.send_response(code)
         self.send_header("Content-Length", str(len(encoded)))
@@ -83,6 +103,8 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--phase", choices=("handshake", "receipt"))
     parser.add_argument("--barrier", type=Path)
+    parser.add_argument("--response", choices=("receipt", "redirect", "disconnect"), default="receipt")
+    parser.add_argument("--trace", type=Path)
     args = parser.parse_args()
     if bool(args.phase) != bool(args.barrier):
         parser.error("--phase and --barrier must be used together")
@@ -90,6 +112,8 @@ if __name__ == "__main__":
         server.receipts = args.output
         server.phase = args.phase
         server.barrier = args.barrier
+        server.response = args.response
+        server.trace = args.trace
         server.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         server.context.load_cert_chain(args.cert, args.key)
         server.serve_forever()
