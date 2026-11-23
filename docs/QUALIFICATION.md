@@ -1,4 +1,20 @@
-# Release qualification for version 0.1.0
+# Alethic Guard release qualification
+
+## Version 0.2.0
+
+The release evidence collector and broker were live-qualified on Ubuntu 24.04.5 x86-64, Linux `7.0.0-42-generic`, and physical Intel KVM. libvirt `10.0.0-2ubuntu8.19` and QEMU `1:8.2.2+ds-0ubuntu1.18` ran inside disposable Ubuntu userspace using the physical host kernel. The lab used private networking, an AppArmor override for namespace mounts, and outer container resource limits. The released 0.1.0 binaries also passed the NIC-free offline guest probe in that environment.
+
+| Check | Observation |
+| --- | --- |
+| Approved delivery | A NIC-free guest requested the real 0.1.0 release record using the typed channel. The exact canonical release record reached the IPv6 HTTPS collector and the returned receipt matched its SHA-256. |
+| Scope and duplicates | Guard denied a role field, a selector outside the configured mode, and a replay of the guest request ID. The collector denied the wrong credential on each endpoint. Repeating the same body and idempotency key returned the existing receipt. Changing the body for that key returned HTTP 409. |
+| Emergency cutoff | After the collector committed the record, the host verified cutoff and refused to start the workload with the cutoff latched. A trusted operator retrieved the existing receipt over HTTPS and reconciled the outcome. |
+| Process recovery | Guard and the collector were killed after database commit and before acknowledgment. The recovered workload stayed stopped and the effect required receipt reconciliation. A retry after restart returned the same receipt with no additional database row. |
+
+The staging test retained the SQLite filesystem across process restarts. See the [guarantee matrix](GUARANTEE_MATRIX.md) and [deployment guide](DEPLOY_LINUX.md) for the applicable scope.
+
+## Version 0.1.0
+
 
 The qualification used an isolated Ubuntu 24.04.5 x86-64 host with nested KVM and synthetic inputs. The live controller used the published `alethic-kernel==0.4.0` wheel. The [guarantee matrix](GUARANTEE_MATRIX.md) identifies the tested packages, firmware and guest image.
 
