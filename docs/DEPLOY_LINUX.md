@@ -33,7 +33,7 @@ sudo alethic-guard workload terminate WORKLOAD_ID
 sudo alethic-guard evidence export WORKLOAD_ID --format jsonl --output evidence.jsonl
 ```
 
-libvirt domains are transient. The VM is checked in its paused state before the daemon starts it. Restarting the daemon reconciles outstanding workloads and requires fresh operator release and start. Guest output remains on the launch overlay. Guard stages verified image bytes in a root-owned, content-addressed launch store before starting libvirt. Launches with the same digest reuse that read-only snapshot.
+libvirt domains are transient. The VM is checked in its paused state before the daemon starts it. Restarting the daemon reconciles outstanding workloads and requires fresh operator release and start. Guest output remains on the launch overlay. Guard stages verified image bytes in a root-owned, content-addressed launch store before starting libvirt. Launches with the same digest reuse that read-only snapshot. The host filesystem must support POSIX ACLs. Guard limits snapshot access to root and the Ubuntu `libvirt-qemu` service account.
 
 ## Mediated preview
 

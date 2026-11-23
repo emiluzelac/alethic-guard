@@ -357,11 +357,18 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
             }
         };
         // Fence admissions and cut off the broker before waiting for libvirt.
-        let guest_network = self.observe_guest(&item);
+        let mut guest_network = self.observe_guest(&item);
+        let absent = match self.vm.state(id) {
+            Ok(VmState::Absent) => true,
+            Ok(_) => false,
+            Err(_) => {
+                guest_network = Observation::Unknown;
+                false
+            }
+        };
         item.terminating |= guest_network != Observation::Verified;
         let mut shutdown = Observation::Unknown;
-        if item.terminating || persisted.is_err() || self.vm.state(id).ok() == Some(VmState::Absent)
-        {
+        if item.terminating || persisted.is_err() || absent {
             if self.vm.verify_absent(id).ok() != Some(true) {
                 let _ = self.vm.destroy(id);
             }
@@ -370,6 +377,10 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
                 Ok(false) => Observation::Failed,
                 Err(_) => Observation::Unknown,
             };
+        }
+        if absent && shutdown != Observation::Verified {
+            guest_network = shutdown;
+            item.terminating = true;
         }
         persisted?;
         if cutoff.is_ok() {

@@ -17,6 +17,7 @@ struct FakeVm {
     drift: Cell<bool>,
     offline: Cell<bool>,
     orphan: Cell<bool>,
+    disappear_after_observation: Cell<bool>,
     persistent: Cell<bool>,
     resume_calls: Cell<u32>,
 }
@@ -42,7 +43,11 @@ impl Hypervisor for FakeVm {
         if self.offline.get() {
             Err("observer unavailable".into())
         } else {
-            Ok(self.state.get().unwrap_or(VmState::Absent))
+            let state = self.state.get().unwrap_or(VmState::Absent);
+            if self.disappear_after_observation.replace(false) {
+                self.state.set(Some(VmState::Absent));
+            }
+            Ok(state)
         }
     }
     fn verify_absent(&self, id: Uuid) -> GuardResult<bool> {
@@ -201,4 +206,21 @@ fn test_observer_failure_fences_a_running_workload() {
     let row = lifecycle.status(item.id).unwrap().unwrap();
     assert_eq!(row.mode, Mode::Containing);
     assert_eq!(row.epoch, 1);
+}
+
+#[test]
+fn test_disappearance_during_cutoff_requires_independent_process_confirmation() {
+    let mut registry = Registry::memory().unwrap();
+    let vm = FakeVm::default();
+    let item = enrolled();
+    registry.enroll(&item).unwrap();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(item.id, launch).unwrap();
+    vm.disappear_after_observation.set(true);
+    vm.orphan.set(true);
+
+    let report = lifecycle.contain(item.id, false).unwrap();
+    assert_eq!(report.guest_network, Observation::Failed);
+    assert_eq!(report.shutdown, Observation::Failed);
+    assert_eq!(report.mode, Mode::Containing);
 }

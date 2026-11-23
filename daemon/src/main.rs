@@ -13,6 +13,7 @@ use alethic_guardd::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
+    ffi::OsStr,
     fs::{self, OpenOptions},
     io::{self, Read},
     os::{
@@ -109,6 +110,7 @@ struct Config {
     policies: PathBuf,
     socket: PathBuf,
     collector: Option<CollectorConfig>,
+    emulator_uid: u32,
 }
 
 fn safe_name(name: &str) -> bool {
@@ -214,11 +216,6 @@ impl Config {
         self.validate_enrolled(row)?;
         let run = self.data.join("run");
         let artifacts = run.join("artifacts");
-        match fs::create_dir(&artifacts) {
-            Ok(()) => fs::set_permissions(&artifacts, fs::Permissions::from_mode(0o755))?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error.into()),
-        }
         secure_directory(&artifacts)?;
         let stage = |source: &Path, digest: &str, extension: &str| -> GuardResult<PathBuf> {
             let key = digest
@@ -237,6 +234,7 @@ impl Config {
             }
             let destination = artifacts.join(format!("{key}.{extension}"));
             pin_file(file, &destination, digest)?;
+            alethic_guardd::artifact::restrict_to_emulator(&destination, self.emulator_uid)?;
             Ok(destination)
         };
         let base = stage(&row.enrollment.image, &row.enrollment.image_digest, "qcow2")?;
@@ -558,6 +556,14 @@ fn serve(config: Config) -> GuardResult<()> {
         }
         secure_directory(directory)?;
     }
+    let artifacts = config.data.join("run/artifacts");
+    match fs::create_dir(&artifacts) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    secure_directory(&artifacts)?;
+    alethic_guardd::artifact::restrict_to_emulator(&artifacts, config.emulator_uid)?;
     let state = config.data.join("state");
     let lock = OpenOptions::new()
         .create(true)
@@ -618,7 +624,29 @@ fn serve(config: Config) -> GuardResult<()> {
     Ok(())
 }
 
+fn emulator_uid() -> GuardResult<u32> {
+    let account = alethic_guardd::vm::command_with_timeout(
+        "3s",
+        "/usr/bin/getent",
+        &[OsStr::new("passwd"), OsStr::new("libvirt-qemu")],
+        None,
+    )?;
+    let mut fields = account.trim_end().split(':');
+    if fields.next() != Some("libvirt-qemu") {
+        return Err("expected the installed libvirt-qemu service account".into());
+    }
+    let uid = fields
+        .nth(1)
+        .ok_or("missing emulator UID")?
+        .parse::<u32>()?;
+    if uid == 0 || uid == u32::MAX {
+        return Err("invalid emulator UID".into());
+    }
+    Ok(uid)
+}
+
 fn run() -> GuardResult<()> {
+    let emulator_uid = emulator_uid()?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let config =
         match args.as_slice() {
@@ -627,18 +655,21 @@ fn run() -> GuardResult<()> {
                 policies: "/etc/alethic-guard/policies".into(),
                 socket: "/run/alethic-guard/operator.sock".into(),
                 collector: None,
+                emulator_uid,
             },
             [data, policies, socket] => Config {
                 data: data.into(),
                 policies: policies.into(),
                 socket: socket.into(),
                 collector: None,
+                emulator_uid,
             },
             [data, policies, socket, collector] => Config {
                 data: data.into(),
                 policies: policies.into(),
                 socket: socket.into(),
                 collector: Some(load_collector(Path::new(collector))?),
+                emulator_uid,
             },
             _ => return Err(
                 "usage: alethic-guardd [DATA_DIR POLICY_DIR OPERATOR_SOCKET [COLLECTOR_CONFIG]]"
