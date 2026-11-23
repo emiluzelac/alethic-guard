@@ -123,7 +123,7 @@ table inet {table} {{
         record(output, "start", call("start", workload))
         console_path = output / "console.log"
         console = subprocess.Popen([
-            "script", "-q", "-c", f"timeout -k 2s 165s virsh console {args.id}", str(console_path),
+            "script", "-q", "-f", "-c", f"timeout -k 2s 165s virsh console {args.id}", str(console_path),
         ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         stack.callback(stop, console, signal.SIGTERM)
         ready = barrier.with_suffix(".ready")

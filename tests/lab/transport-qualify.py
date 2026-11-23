@@ -72,7 +72,7 @@ def observed_console(path):
 
 def serial_console(stack, workload, path):
     process = subprocess.Popen([
-        "script", "-q", "-c", f"timeout -k 2s 115s virsh console {workload['id']}", str(path),
+        "script", "-q", "-f", "-c", f"timeout -k 2s 115s virsh console {workload['id']}", str(path),
     ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     stack.callback(stop, process)
     return path

@@ -15,6 +15,9 @@ args = sys.argv[1:]
 assert args[:2] == ["-c", "qemu:///system"]
 command = args[2]
 setting = json.loads((FIXTURE / "paused-case.json").read_text())
+if command == "dumpxml" and args[3] == setting["uuid"] and setting["case"] == "observation-unavailable":
+    (FIXTURE / "observation-unavailable").touch()
+    raise SystemExit("qualification fixture withheld the live XML observation")
 if command == "resume" and args[3] == setting["uuid"]:
     (FIXTURE / "unexpected-resume").touch()
     raise SystemExit("qualification fixture held the paused domain")

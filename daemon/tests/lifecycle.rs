@@ -19,6 +19,8 @@ struct FakeVm {
     orphan: Cell<bool>,
     disappear_after_observation: Cell<bool>,
     persistent: Cell<bool>,
+    transient_unavailable: Cell<bool>,
+    xml_unavailable: Cell<bool>,
     resume_calls: Cell<u32>,
 }
 
@@ -34,9 +36,15 @@ impl Hypervisor for FakeVm {
     }
 
     fn active_xml(&self, _: Uuid) -> GuardResult<String> {
+        if self.xml_unavailable.get() {
+            return Err("domain XML observation unavailable".into());
+        }
         Ok(self.xml.borrow().clone())
     }
     fn is_transient(&self, _: Uuid) -> GuardResult<bool> {
+        if self.transient_unavailable.get() {
+            return Err("domain persistence observation unavailable".into());
+        }
         Ok(!self.persistent.get())
     }
     fn state(&self, _: Uuid) -> GuardResult<VmState> {
@@ -206,6 +214,31 @@ fn test_observer_failure_fences_a_running_workload() {
     let row = lifecycle.status(item.id).unwrap().unwrap();
     assert_eq!(row.mode, Mode::Containing);
     assert_eq!(row.epoch, 1);
+}
+
+#[test]
+fn test_active_configuration_distinguishes_unavailable_observation_from_drift() {
+    for (transient_unavailable, xml_unavailable, expected) in [
+        (true, false, Observation::Unknown),
+        (false, true, Observation::Unknown),
+        (false, false, Observation::Failed),
+    ] {
+        let mut registry = Registry::memory().unwrap();
+        let vm = FakeVm::default();
+        let item = enrolled();
+        registry.enroll(&item).unwrap();
+        let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+        lifecycle.start(item.id, launch).unwrap();
+        vm.transient_unavailable.set(transient_unavailable);
+        vm.xml_unavailable.set(xml_unavailable);
+        vm.persistent.set(expected == Observation::Failed);
+
+        assert_eq!(lifecycle.verify(item.id).unwrap(), expected);
+        assert_eq!(
+            lifecycle.status(item.id).unwrap().unwrap().mode,
+            Mode::Terminated
+        );
+    }
 }
 
 #[test]

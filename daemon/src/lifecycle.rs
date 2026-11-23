@@ -186,6 +186,11 @@ impl Registry {
     }
 }
 
+enum ActiveBoundary {
+    Verified,
+    Drift(Box<dyn std::error::Error>),
+}
+
 pub struct Lifecycle<'a, H> {
     registry: &'a mut Registry,
     vm: &'a H,
@@ -206,12 +211,26 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
             .ok_or_else(|| "unmanaged workload".into())
     }
 
-    fn verify_active(&self, item: &Workload) -> GuardResult<()> {
+    fn compare_active(&self, item: &Workload) -> GuardResult<ActiveBoundary> {
         let id = item.enrollment.id;
         if !self.vm.is_transient(id)? {
-            return Err("domain persists outside Guard lifecycle authority".into());
+            return Ok(ActiveBoundary::Drift(
+                "domain persists outside Guard lifecycle authority".into(),
+            ));
         }
-        verify_domain(&self.vm.active_xml(id)?, &item.domain()?)
+        let xml = self.vm.active_xml(id)?;
+        let spec = item.domain()?;
+        Ok(match verify_domain(&xml, &spec) {
+            Ok(()) => ActiveBoundary::Verified,
+            Err(error) => ActiveBoundary::Drift(error),
+        })
+    }
+
+    fn verify_active(&self, item: &Workload) -> GuardResult<()> {
+        match self.compare_active(item)? {
+            ActiveBoundary::Verified => Ok(()),
+            ActiveBoundary::Drift(error) => Err(error),
+        }
     }
 
     pub fn start(
@@ -277,8 +296,11 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
                 Ok(false) => Observation::Failed,
                 Err(_) => Observation::Unknown,
             },
-            Ok(_) if self.verify_active(item).is_ok() => Observation::Verified,
-            Ok(_) => Observation::Failed,
+            Ok(_) => match self.compare_active(item) {
+                Ok(ActiveBoundary::Verified) => Observation::Verified,
+                Ok(ActiveBoundary::Drift(_)) => Observation::Failed,
+                Err(_) => Observation::Unknown,
+            },
             Err(_) => Observation::Unknown,
         }
     }

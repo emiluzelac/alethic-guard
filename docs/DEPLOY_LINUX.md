@@ -50,6 +50,8 @@ Use a disposable Ubuntu 24.04 environment under your control. Keep the guest NIC
 
 Install Guard with its `controller` extra to use the pinned Alethic kernel wheel from PyPI. Configure a dedicated unprivileged `alethic-guard-controller` account and a private state directory owned by that account. The collector config is a root-owned read-only JSON file containing an exact HTTPS `target`, approved global unicast `addresses`, absolute `gateway` and `controller_socket` paths, `controller_uid`, and optional trusted `ca_file`. Use `/usr/local/bin/alethic-guard-gateway` as the gateway path and a certificate for the configured hostname. The mediated example uses a synthetic hostname.
 
+If you supply `ca_file`, install the public CA certificate as root-owned mode `0444` in the policy directory. The unprivileged gateway must be able to traverse its parent directory and read the certificate. Keep the collector's private key on the collector.
+
 ```sh
 sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt './python/alethic_guard-0.1.0-py3-none-any.whl[controller]'
 /opt/alethic-guard/venv/bin/alethic-guard profile compile policy/examples/allowlisted-api.yaml --mediated-api --output ./broker-lab.json

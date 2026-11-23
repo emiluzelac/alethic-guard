@@ -30,7 +30,7 @@ fi
 call start > "$output/$mode-start.json"
 sudo virsh domiflist "$id" > "$output/$mode-interfaces.txt"
 sudo virsh dumpxml "$id" > "$output/$mode-domain.xml"
-sudo script -q -c "timeout -s INT 190 virsh console $id" "$output/$mode-console.log" \
+sudo script -q -f -c "timeout -s INT 190 virsh console $id" "$output/$mode-console.log" \
     < /dev/null > /dev/null &
 serial=$!
 for tick in $(seq 1 170); do
