@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Build the Ubuntu 24.04 x86-64 installation archive from a committed checkout.
+set -euo pipefail
+[[ $# == 1 ]] || { echo 'usage: scripts/package-linux OUTPUT_DIRECTORY' >&2; exit 2; }
+mkdir -p -- "$1"
+output=$(realpath -e -- "$1")
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+git diff --quiet HEAD -- || { echo 'Building a release requires committed source.' >&2; exit 1; }
+[[ $(uname -sm) == 'Linux x86_64' ]] || { echo 'Build on Linux x86-64.' >&2; exit 1; }
+
+version=$(sed -nE 's/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/\1/p' pyproject.toml)
+[[ -n $version ]] || { echo 'Could not read the Guard version.' >&2; exit 1; }
+name=alethic-guard-$version-linux-x86_64
+commit=$(git rev-parse HEAD)
+export SOURCE_DATE_EPOCH
+SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$commit")
+build=$(mktemp -d)
+trap 'rm -rf -- "$build"' EXIT
+bundle=$build/$name
+mkdir -p "$bundle/bin" "$bundle/python/wheels"
+git archive "$commit" LICENSE README.md SECURITY.md docs guest packaging policy tests/lab |
+    tar -xf - -C "$bundle"
+
+target=$(realpath -m "${CARGO_TARGET_DIR:-$PWD/daemon/target}")
+for crate in daemon gateway; do
+    cargo +1.85.0 build --release --locked --manifest-path "$crate/Cargo.toml" --target-dir "$target"
+done
+install -m 0755 "$target/release/alethic-guardd" "$target/release/alethic-guard-gateway" "$bundle/bin/"
+uv build --python 3.12 --wheel --out-dir "$bundle/python"
+uv export --locked --no-dev --no-emit-project --extra controller --format requirements.txt \
+    --output-file "$build/requirements.txt" >/dev/null
+uv export --locked --no-dev --no-hashes --no-emit-project --extra controller --format requirements.txt \
+    --output-file "$bundle/python/constraints.txt" >/dev/null
+uv run --no-project --python 3.12 --with pip python -I -m pip download \
+    --disable-pip-version-check --only-binary=:all: --require-hashes \
+    --dest "$bundle/python/wheels" --requirement "$build/requirements.txt"
+
+printf 'Alethic Guard %s\nSource commit %s\n' "$version" "$commit" > "$bundle/BUILD.txt"
+tar -C "$build" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$SOURCE_DATE_EPOCH" \
+    -cf - "$name" | gzip -n > "$output/$name.tar.gz"
+(cd "$output" && sha256sum "$name.tar.gz" > SHA256SUMS)

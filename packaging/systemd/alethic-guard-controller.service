@@ -1,0 +1,18 @@
+[Unit]
+Description=Alethic Guard policy controller
+ConditionPathExists=/etc/alethic-guard/collector.json
+
+[Service]
+Type=simple
+User=alethic-guard-controller
+Group=alethic-guard-controller
+StateDirectory=alethic-guard/controller
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/alethic-guard/current/venv/bin/python -I -m alethic_guard.api /var/lib/alethic-guard/controller/controller.sock /var/lib/alethic-guard/controller/kernel.sqlite3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+Restart=on-failure

@@ -8,6 +8,19 @@ Run `sudo alethic-guard workload emergency-terminate ID` to request immediate VM
 
 When the ordinary operator queue is available again, run `workload terminate ID` to reconcile the registry, gateway state, and journal. Once shutdown is verified and recorded, `workload release ID` clears the durable fence. The emergency listener and the ordinary queue both run inside the Guard daemon, so both require the host daemon process.
 
+## Recovery with the daemon stopped
+
+On the Guard host, stop `alethic-guardd.service` if the service manager is trying to restart it or the process is hung. Run the installed daemon binary directly as root.
+
+```sh
+sudo systemctl stop alethic-guardd.service
+sudo /opt/alethic-guard/current/bin/alethic-guardd --recover WORKLOAD_ID
+```
+
+For a custom deployment, use its installed binary and supply the absolute data directory as the last argument. Recovery takes the same exclusive state lock as the daemon. It reads the existing enrollment, latches the admission fence, cuts the registered broker network, and uses libvirt and process observations to verify shutdown of the enrolled transient domain. Recovery works without either Guard socket or the Python controller.
+
+The JSON response reports admission fence persistence, broker cutoff, VM shutdown, and registry and journal persistence independently. Exit status zero requires all four to be `VERIFIED`. A partial result requires investigation and a retry after restoring the failed dependency. If libvirt is unavailable, restore the hypervisor service and repeat recovery. Once recovery is verified, start Guard and check workload status. A new launch requires an explicit `workload release`.
+
 Contain durably marks a workload as containing and advances its epoch. For an offline VM its verified absence of network interfaces supplies the guest boundary. For the mediated profile the daemon independently installs a host deny, lowers the host veth, stops gateway processes, and verifies the link is gone. It can perform this path while a gateway is stalled. A new launch requires verified shutdown and an explicit operator release.
 
 If the response to an operator release is lost, query `workload status ID` to observe the recorded lifecycle before attempting a fresh start. Starting also requires an open emergency fence. A workload whose installed image or policy has changed requires a new enrollment with the intended artifacts.

@@ -1,18 +1,18 @@
 [Unit]
 Description=Alethic Guard host enforcement
-After=libvirtd.service
+After=libvirtd.service alethic-guard-controller.service
 Requires=libvirtd.service
+Wants=alethic-guard-controller.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/alethic-guardd
+ExecStart=/opt/alethic-guard/current/bin/alethic-guardd --installed
 RuntimeDirectory=alethic-guard
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0711
 UMask=0077
 NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/alethic-guard /run/alethic-guard
+# The host recovery command must see the broker network namespace mounts.
+# Keep guardd in the host mount and network namespaces.
 Restart=on-failure
 
 [Install]

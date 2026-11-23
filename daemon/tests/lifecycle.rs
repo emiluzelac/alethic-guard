@@ -1,6 +1,7 @@
 use alethic_guardd::lifecycle::{Enrolled, LaunchDisks, Lifecycle, Mode, Observation, Registry};
 use alethic_guardd::{
     GuardResult,
+    emergency::Fences,
     vm::{DomainSpec, Hypervisor, VmState},
 };
 use std::{
@@ -104,6 +105,97 @@ fn test_unknown_domain_is_unmanaged() {
     let vm = FakeVm::default();
     let lifecycle = Lifecycle::new(&mut registry, &vm);
     assert!(lifecycle.status(Uuid::new_v4()).unwrap().is_none());
+}
+
+#[test]
+fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
+    let mut registry = Registry::memory().unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let dir = tempdir().unwrap();
+    let fences = Fences::new(dir.path().into());
+    let unregistered = Uuid::new_v4();
+
+    assert!(
+        registry
+            .recover_host(
+                unregistered,
+                |id| fences.cutoff(id, |_| Ok(())),
+                |_| panic!("unexpected shutdown")
+            )
+            .is_err()
+    );
+    assert!(!dir.path().join(unregistered.to_string()).exists());
+    let report = registry
+        .recover_host(
+            id,
+            |id| fences.cutoff(id, |_| Ok(())),
+            |target| {
+                assert_eq!(target, id);
+                assert!(dir.path().join(id.to_string()).is_file());
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(report.admissions, Observation::Verified);
+    assert_eq!(report.broker_cutoff, Observation::Verified);
+    assert_eq!(report.shutdown, Observation::Verified);
+    assert_eq!(report.record, Observation::Verified);
+
+    let row = registry.get(id).unwrap().unwrap();
+    assert_eq!(row.mode, Mode::Terminated);
+    assert_eq!(row.epoch, 1);
+    let vm = FakeVm::default();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    assert!(lifecycle.start(id, launch).is_err());
+    lifecycle.release(id).unwrap();
+}
+
+#[test]
+fn host_recovery_attempts_shutdown_when_fence_storage_is_unavailable() {
+    let mut registry = Registry::memory().unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let dir = tempdir().unwrap();
+    let fences = Fences::new(dir.path().join("missing"));
+    let report = registry
+        .recover_host(id, |id| fences.cutoff(id, |_| Ok(())), |_| Ok(true))
+        .unwrap();
+    assert_eq!(report.admissions, Observation::Unknown);
+    assert_eq!(report.broker_cutoff, Observation::Verified);
+    assert_eq!(report.shutdown, Observation::Verified);
+    assert_eq!(report.record, Observation::Verified);
+    assert_eq!(registry.get(id).unwrap().unwrap().mode, Mode::Containing);
+}
+
+#[test]
+fn host_recovery_preserves_containment_when_shutdown_cannot_be_observed() {
+    let mut registry = Registry::memory().unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let dir = tempdir().unwrap();
+    let fences = Fences::new(dir.path().into());
+
+    let report = registry
+        .recover_host(
+            id,
+            |id| fences.cutoff(id, |_| Ok(())),
+            |_| Err("observer unavailable".into()),
+        )
+        .unwrap();
+    assert_eq!(report.admissions, Observation::Verified);
+    assert_eq!(report.shutdown, Observation::Unknown);
+    assert_eq!(registry.get(id).unwrap().unwrap().mode, Mode::Containing);
+    let report = registry
+        .recover_host(id, |id| fences.cutoff(id, |_| Ok(())), |_| Ok(true))
+        .unwrap();
+    assert_eq!(report.shutdown, Observation::Verified);
+    let row = registry.get(id).unwrap().unwrap();
+    assert_eq!(row.mode, Mode::Terminated);
+    assert_eq!(row.epoch, 1);
 }
 
 #[test]

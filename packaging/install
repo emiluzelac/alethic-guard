@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Install from the extracted, checksum-verified Ubuntu 24.04 archive.
+set -euo pipefail
+umask 022
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+[[ $# == 0 && $EUID == 0 ]] || die "Run this installer as root without arguments."
+. /etc/os-release
+[[ $ID == ubuntu && $VERSION_ID == 24.04 && $(uname -m) == x86_64 && -c /dev/kvm ]] ||
+    die "Alethic Guard requires Ubuntu 24.04 x86-64 and /dev/kvm."
+[[ -d /run/systemd/system ]] || die "The installer requires a running systemd host."
+for tool in virsh qemu-img setfacl python3 ip nft timeout setsid systemd-sysusers; do
+    command -v "$tool" >/dev/null || die "Missing required command: $tool"
+done
+[[ -x /usr/bin/qemu-system-x86_64 ]] || die "Install the Ubuntu QEMU system emulator."
+getent passwd libvirt-qemu >/dev/null || die "Install the Ubuntu libvirt QEMU service account."
+
+bundle=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd -- "$bundle"
+units=(alethic-guardd.service alethic-guard-controller.service)
+shopt -s nullglob
+wheels=(python/alethic_guard-*-py3-none-any.whl)
+[[ ${#wheels[@]} == 1 && -d python/wheels && -f python/constraints.txt ]] ||
+    die "The archive must contain the Guard wheel and its pinned dependencies."
+payload=(bin/alethic-guardd bin/alethic-guard-gateway "packaging/systemd/${units[0]}" "packaging/systemd/${units[1]}" python/constraints.txt "${wheels[0]}" python/wheels/*.whl)
+fingerprint=$(sha256sum "${payload[@]}" | sha256sum | cut -d ' ' -f 1)
+
+install_dir() {
+    local path=$1 mode=$2
+    if [[ ! -e $path && ! -L $path ]]; then
+        install -d -o root -g root -m "$mode" -- "$path"
+    fi
+    [[ -d $path && $(realpath -e -- "$path") == "$path" ]] ||
+        die "Expected a canonical directory: $path"
+    [[ $(stat -c %u -- "$path") == 0 ]] ||
+        die "Expected a root-owned directory: $path"
+    local permissions
+    permissions=$(stat -c %a -- "$path")
+    (( (8#$permissions & 0022) == 0 )) || die "Unexpected write permissions: $path"
+}
+
+services_stopped() {
+    local unit state
+    for unit in "${units[@]}"; do
+        state=$(systemctl show --property=ActiveState --value "$unit")
+        case "$state" in
+            inactive|failed) ;;
+            *) die "Stop $unit before installing or upgrading Guard." ;;
+        esac
+    done
+}
+
+prefix=/opt/alethic-guard
+install_dir "$prefix" 0755
+exec 9>"$prefix/.install.lock"
+flock -n 9 || die "Another Alethic Guard installation is running."
+services_stopped
+
+install_dir "$prefix/releases" 0755
+install_dir /etc/alethic-guard 0755
+install_dir /etc/alethic-guard/policies 0755
+install_dir /var/lib/alethic-guard 0755
+install_dir /var/lib/alethic-guard/images 0755
+install_dir /var/lib/alethic-guard/run 0755
+install_dir /var/lib/alethic-guard/state 0700
+
+systemd-sysusers - <<'ACCOUNT'
+u alethic-guard-controller - "Alethic Guard policy controller"
+ACCOUNT
+
+if [[ ! -f $prefix/current/release-id || $(<"$prefix/current/release-id") != "$fingerprint" ]]; then
+    generation=$(mktemp -d "$prefix/releases/release.XXXXXXXX")
+    chmod 0755 "$generation"
+    install -d -m 0755 "$generation/bin"
+    install -m 0755 bin/alethic-guardd bin/alethic-guard-gateway "$generation/bin/"
+    python3 -m venv "$generation/venv"
+    "$generation/venv/bin/python" -I -m pip --isolated --disable-pip-version-check install \
+        --no-index --only-binary :all: --find-links python/wheels \
+        --constraint python/constraints.txt "${wheels[0]}[controller]"
+    "$generation/venv/bin/python" -I -m pip --isolated check
+    "$generation/venv/bin/alethic-guard" --help >/dev/null
+    printf '%s\n' "$fingerprint" > "$generation/release-id"
+else
+    generation=$(realpath -e -- "$prefix/current")
+fi
+
+services_stopped
+for unit in "${units[@]}"; do
+    staged=$(mktemp "/etc/systemd/system/.$unit.XXXXXXXX")
+    install -m 0644 "packaging/systemd/$unit" "$staged"
+    mv -fT -- "$staged" "/etc/systemd/system/$unit"
+done
+activation=$(mktemp -d "$prefix/.activate.XXXXXXXX")
+ln -s -- "$generation" "$activation/current"
+mv -fT -- "$activation/current" "$prefix/current"
+rmdir -- "$activation"
+systemctl daemon-reload
+printf 'Installed Alethic Guard at %s/current. Configure policies and approved inputs before starting the service.\n' "$prefix"

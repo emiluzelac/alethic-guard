@@ -2,7 +2,7 @@ use crate::{
     GuardResult,
     vm::{DomainSpec, Hypervisor, VmState, verify_domain},
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -95,6 +95,18 @@ impl Workload {
             .ok_or("revocation epoch exhausted")?;
         Ok(())
     }
+
+    fn begin_containment(&mut self, terminate: bool) -> GuardResult<()> {
+        if !matches!(
+            self.mode,
+            Mode::Containing | Mode::Contained | Mode::Terminated
+        ) {
+            self.revoke()?;
+        }
+        self.terminating |= terminate;
+        self.mode = Mode::Containing;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -111,6 +123,28 @@ pub struct Registry {
     pub(crate) conn: Connection,
 }
 
+#[derive(Debug, Serialize)]
+pub struct HostRecoveryReport {
+    pub id: Uuid,
+    pub admissions: Observation,
+    pub broker_cutoff: Observation,
+    pub shutdown: Observation,
+    pub record: Observation,
+}
+
+impl HostRecoveryReport {
+    pub fn verified(&self) -> bool {
+        [
+            self.admissions,
+            self.broker_cutoff,
+            self.shutdown,
+            self.record,
+        ]
+        .into_iter()
+        .all(|observation| observation == Observation::Verified)
+    }
+}
+
 impl Registry {
     pub fn open(path: &Path) -> GuardResult<Self> {
         Self::connect(Connection::open(path)?)
@@ -118,6 +152,12 @@ impl Registry {
 
     pub fn memory() -> GuardResult<Self> {
         Self::connect(Connection::open_in_memory()?)
+    }
+
+    pub fn open_for_recovery(path: &Path) -> GuardResult<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        Ok(Self { conn })
     }
 
     fn connect(conn: Connection) -> GuardResult<Self> {
@@ -183,6 +223,62 @@ impl Registry {
         let raw = query.query_map([], |row| row.get::<_, String>(0))?;
         raw.map(|record| Ok(serde_json::from_str(&record?)?))
             .collect()
+    }
+
+    pub fn recover_host(
+        &mut self,
+        id: Uuid,
+        fence: impl FnOnce(Uuid) -> GuardResult<()>,
+        stop: impl FnOnce(Uuid) -> GuardResult<bool>,
+    ) -> GuardResult<HostRecoveryReport> {
+        let mut item = self.get(id)?.ok_or("unknown workload")?;
+        if item.enrollment.id != id {
+            return Err("registry enrollment identity mismatch".into());
+        }
+        let intent = item.begin_containment(true).and_then(|()| self.save(&item));
+        let observe = |step, result| match result {
+            Ok(true) => Observation::Verified,
+            Ok(false) => Observation::Failed,
+            Err(error) => {
+                eprintln!("host recovery {step} for {id}: {error}");
+                Observation::Unknown
+            }
+        };
+        let admissions = observe("admissions fence", fence(id).map(|()| true));
+        let broker_cutoff = observe(
+            "broker cutoff",
+            crate::broker::stop(self, Some(id)).map(|()| true),
+        );
+        let shutdown = observe("shutdown", stop(id));
+        let completed = [admissions, broker_cutoff, shutdown]
+            .into_iter()
+            .all(|observation| observation == Observation::Verified);
+
+        let recorded = intent.and_then(|()| {
+            if broker_cutoff == Observation::Verified {
+                self.recover_workload_effects(Some(id))?;
+            }
+            if completed {
+                item.mode = Mode::Terminated;
+                self.save(&item)?;
+            }
+            self.record_host_observation(
+                id,
+                "HOST_RECOVERY_OBSERVED",
+                if completed {
+                    "TERMINATED"
+                } else {
+                    "INCOMPLETE"
+                },
+            )
+        });
+        Ok(HostRecoveryReport {
+            id,
+            admissions,
+            broker_cutoff,
+            shutdown,
+            record: observe("registry and journal", recorded.map(|()| true)),
+        })
     }
 }
 
@@ -372,14 +468,7 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
 
     pub fn contain(&mut self, id: Uuid, terminate: bool) -> GuardResult<ContainmentReport> {
         let mut item = self.known(id)?;
-        if !matches!(
-            item.mode,
-            Mode::Containing | Mode::Contained | Mode::Terminated
-        ) {
-            item.revoke()?;
-        }
-        item.terminating |= terminate;
-        item.mode = Mode::Containing;
+        item.begin_containment(terminate)?;
         let persisted = self.registry.save(&item);
         // Attempt the host network cutoff even if the lifecycle write failed.
         let cutoff = crate::broker::stop(self.registry, Some(id));

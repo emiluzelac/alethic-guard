@@ -41,6 +41,7 @@ impl GuestRequest {
 pub struct CollectorConfig {
     pub target: String,
     pub addresses: Vec<IpAddr>,
+    #[serde(default)]
     pub gateway: PathBuf,
     pub controller_socket: PathBuf,
     pub controller_uid: u32,

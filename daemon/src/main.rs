@@ -546,7 +546,10 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
     if metadata.len() > 4096 {
         return Err("collector configuration exceeds maximum size".into());
     }
-    let config: CollectorConfig = serde_json::from_slice(&fs::read(path)?)?;
+    let mut config: CollectorConfig = serde_json::from_slice(&fs::read(path)?)?;
+    if config.gateway.as_os_str().is_empty() {
+        config.gateway = std::env::current_exe()?.with_file_name("alethic-guard-gateway");
+    }
     let binary = &config.gateway;
     secure_directory(
         binary
@@ -600,10 +603,79 @@ fn bind_socket(path: &Path) -> GuardResult<UnixListener> {
     Ok(UnixListener::bind(path)?)
 }
 
-fn serve(config: Config) -> GuardResult<()> {
+fn require_root() -> GuardResult<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("guardd must run as host root".into());
     }
+    Ok(())
+}
+
+fn acquire_daemon_lock(state: &Path) -> GuardResult<fs::File> {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(state.join("guardd.lock"))?;
+    let metadata = lock.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err("expected a private root-owned daemon lock file".into());
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err("Guard state is locked by a running daemon or another recovery".into());
+        }
+        return Err(error.into());
+    }
+    Ok(lock)
+}
+
+fn fence_directory(state: &Path) -> GuardResult<PathBuf> {
+    let path = state.join("emergency");
+    match fs::create_dir(&path) {
+        Ok(()) => fs::File::open(state)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    secure_directory(&path)?;
+    Ok(path)
+}
+
+fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
+    require_root()?;
+    let state = data.join("state");
+    secure_directory(&state)?;
+    let _lock = acquire_daemon_lock(&state)?;
+    let database = state.join("guard.sqlite3");
+    let metadata = fs::symlink_metadata(&database)?;
+    if !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err("expected a private root-owned enrollment database".into());
+    }
+    let mut registry = Registry::open_for_recovery(&database)?;
+    let report = registry.recover_host(
+        id,
+        |id| Fences::new(fence_directory(&state)?).cutoff(id, |_| Ok(())),
+        Libvirt::emergency_shutdown,
+    )?;
+    println!("{}", serde_json::to_string(&report)?);
+    if !report.verified() {
+        return Err("host recovery was incomplete; inspect the individual observations".into());
+    }
+    Ok(())
+}
+
+fn serve(config: Config) -> GuardResult<()> {
+    require_root()?;
     for directory in [
         &config.data,
         &config.policies,
@@ -620,6 +692,8 @@ fn serve(config: Config) -> GuardResult<()> {
         }
         secure_directory(directory)?;
     }
+    let state = config.data.join("state");
+    let _lock = acquire_daemon_lock(&state)?;
     let artifacts = config.data.join("run/artifacts");
     match fs::create_dir(&artifacts) {
         Ok(()) => {}
@@ -628,30 +702,12 @@ fn serve(config: Config) -> GuardResult<()> {
     }
     secure_directory(&artifacts)?;
     alethic_guardd::artifact::restrict_to_emulator(&artifacts, config.emulator_uid)?;
-    let state = config.data.join("state");
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join("guardd.lock"))?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
     let mut registry = Registry::open(&state.join("guard.sqlite3"))?;
     broker::stop(&mut registry, None)?;
     registry.recover_effects()?;
     Lifecycle::new(&mut registry, &Libvirt).reconcile()?;
 
-    let fence_path = state.join("emergency");
-    match fs::create_dir(&fence_path) {
-        Ok(()) => fs::File::open(&state)?.sync_all()?,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.into()),
-    }
-    secure_directory(&fence_path)?;
-    let fences = Arc::new(Fences::new(fence_path));
+    let fences = Arc::new(Fences::new(fence_directory(&state)?));
     // Startup closes every previous broker binding before serving either socket.
     for row in registry.all()? {
         fences.register(row.enrollment.id)?;
@@ -716,15 +772,37 @@ fn emulator_uid() -> GuardResult<u32> {
 }
 
 fn run() -> GuardResult<()> {
-    let emulator_uid = emulator_uid()?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if matches!(args.first(), Some(flag) if flag == "--recover") {
+        let [_, id, data @ ..] = args.as_slice() else {
+            return Err("usage: alethic-guardd --recover WORKLOAD_ID [DATA_DIR]".into());
+        };
+        let dir = match data {
+            [] => Path::new("/var/lib/alethic-guard"),
+            [dir] => Path::new(dir),
+            _ => return Err("usage: alethic-guardd --recover WORKLOAD_ID [DATA_DIR]".into()),
+        };
+        return recover(id.to_str().ok_or("invalid workload ID")?.parse()?, dir);
+    }
+    let installed = matches!(args.as_slice(), [flag] if flag == "--installed");
+    let collector = if installed {
+        let path = Path::new("/etc/alethic-guard/collector.json");
+        match fs::symlink_metadata(path) {
+            Ok(_) => Some(load_collector(path)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        None
+    };
+    let emulator_uid = emulator_uid()?;
     let config =
-        match args.as_slice() {
+        match if installed { &[] } else { args.as_slice() } {
             [] => Config {
                 data: "/var/lib/alethic-guard".into(),
                 policies: "/etc/alethic-guard/policies".into(),
                 socket: "/run/alethic-guard/operator.sock".into(),
-                collector: None,
+                collector,
                 emulator_uid,
             },
             [data, policies, socket] => Config {
@@ -742,7 +820,7 @@ fn run() -> GuardResult<()> {
                 emulator_uid,
             },
             _ => return Err(
-                "usage: alethic-guardd [DATA_DIR POLICY_DIR OPERATOR_SOCKET [COLLECTOR_CONFIG]]"
+                "usage: alethic-guardd [--installed | DATA_DIR POLICY_DIR OPERATOR_SOCKET [COLLECTOR_CONFIG]]"
                     .into(),
             ),
         };

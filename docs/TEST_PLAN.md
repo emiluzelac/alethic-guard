@@ -32,9 +32,9 @@ Run a pinned open-weight CPU model inside an enrolled VM. Record the model and g
 | Shutdown observation is unavailable | The emergency operation reports the shutdown as unknown while preserving the admission fence. |
 | Independent reproduction | A second operator runs the procedures from the tagged source and checksummed archive. The published results identify those exact inputs and include sanitized observations and verification of a checkpoint retained off-host. |
 
-## Proposed qualification for v0.4.0
+## Production qualification for v0.4.0
 
-Use the v0.3.0 measurement as a reference case. Run repeated tests in a disposable lab with resource limits.
+Use the v0.3.0 measurement as a reference case. Run the [recovery and repeated shutdown procedures](../tests/lab/production/README.md) in a disposable lab with resource limits.
 
 | Case | Evidence to collect |
 | --- | --- |

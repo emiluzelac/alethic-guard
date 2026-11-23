@@ -594,7 +594,11 @@ impl Hypervisor for Libvirt {
         virsh(&["resume", &id.to_string()], None).map(|_| ())
     }
     fn destroy(&self, id: Uuid) -> GuardResult<()> {
-        virsh(&["destroy", &id.to_string()], None).map(|_| ())
+        if Self::emergency_shutdown(id)? {
+            Ok(())
+        } else {
+            Err("unable to verify managed VM shutdown".into())
+        }
     }
 
     fn verify_absent(&self, id: Uuid) -> GuardResult<bool> {
