@@ -1,22 +1,30 @@
 # Linux lab deployment
 
-The initial target is Ubuntu 24.04 LTS on x86-64 with /dev/kvm and system libvirt. Install the distribution packages for libvirt, virsh, QEMU and qemu-img. The mediated lab additionally requires iproute2, nftables, and a dedicated collector route. See [the runtime matrix](GUARANTEE_MATRIX.md) for measured configurations.
+Use the Ubuntu 24.04 x86-64 host and KVM configuration described in the [runtime matrix](GUARANTEE_MATRIX.md). Install the distribution packages for libvirt, virsh, QEMU, qemu-img, POSIX ACL tools, and `python3-venv`. The mediated lab additionally requires iproute2, nftables, and a dedicated collector route.
+
+Use the archive and `SHA256SUMS` in the [public release downloads](https://github.com/emiluzelac/alethic-guard/tree/release-assets/v0.1.0). Verify the archive checksum before unpacking. The archive contains the two host binaries, the systemd unit, the policy examples, and `alethic_guard-0.1.0-py3-none-any.whl`. Run the following from the unpacked directory.
+
+```sh
+sudo python3 -m venv /opt/alethic-guard/venv
+sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt ./python/alethic_guard-0.1.0-py3-none-any.whl
+sudo install -m 0755 bin/alethic-guardd /usr/local/sbin/alethic-guardd
+sudo install -m 0755 bin/alethic-guard-gateway /usr/local/bin/alethic-guard-gateway
+```
+
+For a source build, build each Rust crate with `cargo build --release --locked`, install the binaries at the same paths, and install the Python project in the virtual environment. The remaining commands use the archive paths.
 
 ## Offline setup
 
-Build both Rust binaries and install the Python CLI in a host environment. Use a root-owned, non-writable installation path for each binary.
-
 ```sh
-cargo build --release --manifest-path daemon/Cargo.toml --locked
-sudo install -m 0755 daemon/target/release/alethic-guardd /usr/local/sbin/alethic-guardd
 sudo install -d -m 0755 /var/lib/alethic-guard /var/lib/alethic-guard/images /var/lib/alethic-guard/run
 sudo install -d -m 0700 /var/lib/alethic-guard/state
 sudo install -d -m 0755 /etc/alethic-guard/policies
-alethic-guard profile compile policy/examples/offline-research.yaml --output ./offline-research.json
+/opt/alethic-guard/venv/bin/alethic-guard profile compile policy/examples/offline-research.yaml --output ./offline-research.json
 sudo install -m 0444 ./offline-research.json /etc/alethic-guard/policies/
 sudo install -m 0444 ./approved-guest.qcow2 /var/lib/alethic-guard/images/
 sudo install -m 0444 ./approved-input.raw /var/lib/alethic-guard/images/
 sudo install -m 0644 packaging/systemd/alethic-guardd.service /etc/systemd/system/
+sudo systemctl daemon-reload
 sudo systemctl start alethic-guardd.service
 ```
 
@@ -25,12 +33,13 @@ Verify the guest image against its publisher or your own image approval before s
 Use the root operator identity for workload commands. Invoke the CLI by its absolute installed path when using sudo and a virtual environment.
 
 ```sh
-sudo alethic-guard workload create --profile offline-research --image approved-guest.qcow2 --input approved-input.raw
-sudo alethic-guard workload start WORKLOAD_ID
-sudo alethic-guard workload verify WORKLOAD_ID
-sudo alethic-guard workload contain WORKLOAD_ID
-sudo alethic-guard workload terminate WORKLOAD_ID
-sudo alethic-guard evidence export WORKLOAD_ID --format jsonl --output evidence.jsonl
+guard=/opt/alethic-guard/venv/bin/alethic-guard
+sudo "$guard" workload create --profile offline-research --image approved-guest.qcow2 --input approved-input.raw
+sudo "$guard" workload start WORKLOAD_ID
+sudo "$guard" workload verify WORKLOAD_ID
+sudo "$guard" workload contain WORKLOAD_ID
+sudo "$guard" workload terminate WORKLOAD_ID
+sudo "$guard" evidence export WORKLOAD_ID --format jsonl --output evidence.jsonl
 ```
 
 libvirt domains are transient. The VM is checked in its paused state before the daemon starts it. Restarting the daemon reconciles outstanding workloads and requires fresh operator release and start. Guest output remains on the launch overlay. Guard stages verified image bytes in a root-owned, content-addressed launch store before starting libvirt. Launches with the same digest reuse that read-only snapshot. The host filesystem must support POSIX ACLs. Guard limits snapshot access to root and the Ubuntu `libvirt-qemu` service account.
@@ -39,11 +48,18 @@ libvirt domains are transient. The VM is checked in its paused state before the 
 
 Use a disposable Ubuntu 24.04 environment under your control. Keep the guest NIC-free and make the collector reachable only over an isolated lab route. Configure IP forwarding on that host. Reserve the UID range 300001–304094, GID 300000, names `aleg*`/`agw*`/`age*`, and subnet ranges `10.254.0.0/18` and `fd42:a1e7::/32` for Guard. Use secure filesystem ownership and host peer credentials even in the lab.
 
-Install Guard with its `controller` extra to use the pinned Alethic kernel wheel from PyPI. Launch the controller under a dedicated unprivileged UID with a private state directory. Launch the following with the daemon's trusted host configuration. The collector config is a root-owned read-only JSON file containing an exact HTTPS `target`, approved global unicast `addresses`, absolute `gateway` and `controller_socket` paths, `controller_uid`, and optional trusted `ca_file`. Use a certificate for the configured hostname. The mediated example is a template with a synthetic hostname.
+Install Guard with its `controller` extra to use the pinned Alethic kernel wheel from PyPI. Configure a dedicated unprivileged `alethic-guard-controller` account and a private state directory owned by that account. The collector config is a root-owned read-only JSON file containing an exact HTTPS `target`, approved global unicast `addresses`, absolute `gateway` and `controller_socket` paths, `controller_uid`, and optional trusted `ca_file`. Use `/usr/local/bin/alethic-guard-gateway` as the gateway path and a certificate for the configured hostname. The mediated example uses a synthetic hostname.
 
 ```sh
-alethic-guard profile compile policy/examples/allowlisted-api.yaml --mediated-api --output ./broker-lab.json
-sudo alethic-guardd /var/lib/alethic-guard /etc/alethic-guard/policies /run/alethic-guard/operator.sock /etc/alethic-guard/collector.json
+sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt './python/alethic_guard-0.1.0-py3-none-any.whl[controller]'
+/opt/alethic-guard/venv/bin/alethic-guard profile compile policy/examples/allowlisted-api.yaml --mediated-api --output ./broker-lab.json
+sudo install -m 0444 ./broker-lab.json /etc/alethic-guard/policies/
+sudo install -d -m 0700 -o alethic-guard-controller -g alethic-guard-controller /var/lib/alethic-guard/controller
+sudo systemd-run --unit=alethic-guard-controller --uid=alethic-guard-controller --gid=alethic-guard-controller --property=NoNewPrivileges=yes \
+  /opt/alethic-guard/venv/bin/python -I -m alethic_guard.api /var/lib/alethic-guard/controller/controller.sock /var/lib/alethic-guard/controller/kernel.sqlite3
+sudo systemctl stop alethic-guardd.service
+sudo install -d -m 0711 /run/alethic-guard
+sudo /usr/local/sbin/alethic-guardd /var/lib/alethic-guard /etc/alethic-guard/policies /run/alethic-guard/operator.sock /etc/alethic-guard/collector.json
 ```
 
 The mediated operator socket parent must permit traversal by the dedicated gateway users. The socket is limited by owner/group and peer credentials. Guard creates a second socket at `operator.sock.emergency`, with mode `0600` and a host-root peer check, for `workload cutoff`. During startup, the daemon stops and reconciles any gateway from a previous incarnation before admitting new work. Rotate the root-owned configuration and requalify if you change the collector address, TLS trust, guest image, or backend. See [the lab instructions](../tests/lab/README.md).

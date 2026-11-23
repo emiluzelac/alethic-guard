@@ -35,7 +35,7 @@ CASES = {
 
 
 def operator(command, request):
-    return [sys.executable, str(TOOLS / "operator.py"), str(SOCKET), command, json.dumps(request)]
+    return [sys.executable, str(TOOLS / "guard-operator.py"), str(SOCKET), command, json.dumps(request)]
 
 
 def call(command, request, timeout=120):

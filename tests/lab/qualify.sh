@@ -16,7 +16,7 @@ mkdir -p "$output"
 tools=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 socket=/run/alethic-guard/operator.sock
 request=$(printf '{"id":"%s"}' "$id")
-call() { sudo python3 "$tools/operator.py" "$socket" "$1" "$request"; }
+call() { sudo python3 "$tools/guard-operator.py" "$socket" "$1" "$request"; }
 
 sudo timeout 210 tcpdump -n -i guard-observe -U -w "$output/$mode.pcap" "$filter" \
     > "$output/$mode-pcap.log" 2>&1 &
@@ -39,6 +39,6 @@ for tick in $(seq 1 170); do
 done
 call contain > "$output/$mode-contain.json"
 call terminate > "$output/$mode-terminate.json"
-sudo python3 "$tools/operator.py" "$socket" evidence_page "$(printf '{"id":"%s","after":0}' "$id")" > "$output/$mode-events.json"
+sudo python3 "$tools/guard-operator.py" "$socket" evidence_page "$(printf '{"id":"%s","after":0}' "$id")" > "$output/$mode-events.json"
 wait "$serial" || true
 grep -a "$marker" "$output/$mode-console.log"

@@ -6,6 +6,8 @@ Run `sudo alethic-guard workload cutoff ID` to fence broker admissions and cut b
 
 Contain durably marks a workload as containing and advances its epoch. For an offline VM its verified absence of network interfaces supplies the guest boundary. For the mediated profile the daemon independently installs a host deny, lowers the host veth, stops gateway processes, and verifies the link is gone. It can perform this path while a gateway is stalled. A new launch requires verified shutdown and an explicit operator release.
 
+If the response to an operator release is lost, query `workload status ID` to observe the recorded lifecycle before attempting a fresh start. Starting also requires an open emergency fence. A workload whose installed image or policy has changed requires a new enrollment with the intended artifacts.
+
 Terminate applies containment and asks the hypervisor to stop the VM. Guard checks both the hypervisor and host process state before reporting shutdown. If an observer fails or a transition is interrupted, Guard keeps the durable containment state and reports the affected boundary as unknown.
 
 A gateway rechecks authority before opening the TLS connection and before writing the authorized request. The revocation barrier is the verified host cutoff after fencing. Data already past that boundary may reach the collector. Use the emergency response for the host network observation and the normal containment or termination response for the hypervisor observation.

@@ -39,3 +39,11 @@ done
 The cases compare guest results, actual HTTP requests, and TCP flows. The redirect points to a second path on the same trusted TLS endpoint. The journal case aborts effect insertion only for the test workload. The crash cases kill the selected lab process after the collector records the receipt, then repeat the same request ID after explicit release and a fresh guest boot. Run the daemon crash case last because it restarts Guard under a new transient unit.
 
 The packet tests intentionally use synthetic markers. A UDP probe on port 443 verifies the path at the transport layer. It does not exercise a full QUIC handshake.
+
+## Release candidate checks
+
+The scripts in `release-fixtures/` are for the disposable lab. The paused domain fixture substitutes a controlled variation into the input to libvirt, observes the resulting real paused domain, and detects any attempted resume. The interface variant uses `guard-drift0`, an isolated host bridge without IP addresses or uplinks. The mount variant uses an empty, read-only directory. The input variant uses a distinct approved synthetic fixture.
+
+The permit fixture runs under the ordinary per-workload gateway identity and requests authority from the installed daemon and controller without sending collector traffic. The expiry case holds the grant past its ten-second lifetime. The stale case replaces the test controller while the observed grant is still valid. Review the daemon responses, effect counts, and calibrated collector capture together. Use the regular packaged gateway for the positive transport control.
+
+Repeat the install on a fresh Ubuntu image with the tested packages and the published kernel wheel. Verify the systemd-managed offline workload, a real mediated collector receipt, and the CLI journal export. Boot the unsupported-host case with nested virtualization disabled and check that a start request leaves the workload stopped. Use the [release qualification](../../docs/QUALIFICATION.md) for the observations and the [guarantee matrix](../../docs/GUARANTEE_MATRIX.md) for the tested environment.

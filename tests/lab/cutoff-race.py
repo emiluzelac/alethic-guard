@@ -26,7 +26,7 @@ IMAGE = "/var/lib/alethic-guard/images/noble-lab.qcow2"
 
 def operator(command, data, emergency=False):
     path = SOCKET.with_suffix(".sock.emergency") if emergency else SOCKET
-    return [sys.executable, str(TOOLS / "operator.py"), str(path), command, json.dumps(data)]
+    return [sys.executable, str(TOOLS / "guard-operator.py"), str(path), command, json.dumps(data)]
 
 
 def call(command, data, emergency=False):

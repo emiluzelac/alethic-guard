@@ -4,7 +4,7 @@ Alethic Guard is an experimental Linux companion to the [Alethic kernel](https:/
 
 The offline profile creates a NIC-free guest with an isolated disk overlay and optional read-only inputs. The mediated preview adds a dedicated channel for a single synthetic TLS collector operation. Host policy, live grant redemption, and the broker's network namespace govern that operation.
 
-See the [deployment instructions](docs/DEPLOY_LINUX.md), [threat model](docs/THREAT_MODEL.md), and [guarantee matrix](docs/GUARANTEE_MATRIX.md) before running the lab. Use synthetic inputs on an isolated qualification host.
+The first public release is a lab preview for the [qualified Ubuntu/KVM configuration](docs/GUARANTEE_MATRIX.md). Use synthetic inputs on an isolated host. See the [Linux deployment instructions](docs/DEPLOY_LINUX.md), [qualification results](docs/QUALIFICATION.md), and [threat model](docs/THREAT_MODEL.md).
 
 ## Development
 
