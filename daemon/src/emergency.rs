@@ -1,11 +1,13 @@
-//! Root-only broker cutoff independent of the ordinary operator queue.
+//! Root-only broker cutoff and guest shutdown outside the ordinary operator queue.
 
 use crate::{
     GuardResult,
     auth::peer_uid,
     evidence::monotonic_ns,
+    lifecycle::Observation,
     network::Sandbox,
     protocol::{configure, read_frame, write_frame},
+    vm::Libvirt,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -28,6 +30,7 @@ struct WorkloadGate {
     // Odd generations are latched. Every cutoff invalidates a pending release.
     generation: AtomicU64,
     transition: Mutex<NetworkState>,
+    guest: Mutex<()>,
 }
 
 struct NetworkState {
@@ -80,6 +83,7 @@ impl Fences {
                 completed_cutoff: initial,
                 sandbox: None,
             }),
+            guest: Mutex::new(()),
         });
         gates.insert(id, Arc::clone(&gate));
         Ok(gate)
@@ -129,6 +133,20 @@ impl Fences {
         Ok(result)
     }
 
+    pub fn guest_operation<T>(
+        &self,
+        id: Uuid,
+        run: impl FnOnce() -> GuardResult<T>,
+    ) -> GuardResult<T> {
+        let gate = self.gate(id)?;
+        let _guest = gate
+            .guest
+            .lock()
+            .map_err(|_| "guest transition unavailable")?;
+        gate.check()?;
+        run()
+    }
+
     pub fn cutoff<T>(
         &self,
         id: Uuid,
@@ -167,6 +185,47 @@ impl Fences {
         Ok(observed)
     }
 
+    pub fn emergency_terminate(
+        &self,
+        id: Uuid,
+        cut: impl FnOnce(Option<Sandbox>) -> GuardResult<()>,
+        stop: impl FnOnce() -> GuardResult<bool>,
+    ) -> GuardResult<serde_json::Value> {
+        if !self.is_registered(id)? {
+            return Err("unmanaged workload".into());
+        }
+        let gate = self.gate(id)?;
+        // Even a stuck start or resume must not delay fencing broker admissions.
+        let guest = gate.guest.try_lock().ok();
+        let cutoff = self.cutoff(id, cut);
+        let fenced = if let Err(error) = cutoff {
+            eprintln!("emergency cutoff for {id}: {error}");
+            Observation::Unknown
+        } else {
+            Observation::Verified
+        };
+        let shutdown = if let Some(_guest) = guest {
+            match stop() {
+                Ok(true) => Observation::Verified,
+                Ok(false) => Observation::Failed,
+                Err(error) => {
+                    eprintln!("emergency VM shutdown for {id}: {error}");
+                    Observation::Unknown
+                }
+            }
+        } else {
+            Observation::Unknown
+        };
+        Ok(json!({
+            "id": id,
+            "admissions": fenced,
+            "broker_cutoff": fenced,
+            "shutdown": shutdown,
+            "observed_at_unix_ns": unix_ns()?,
+            "host_monotonic_ns": monotonic_ns()?,
+        }))
+    }
+
     pub fn release<T>(&self, id: Uuid, run: impl FnOnce() -> GuardResult<T>) -> GuardResult<T> {
         let gate = self
             .gates
@@ -177,6 +236,10 @@ impl Fences {
             .ok_or("unmanaged workload")?;
         let version = gate.generation();
         let result = run()?;
+        let _guest = gate
+            .guest
+            .lock()
+            .map_err(|_| "guest transition unavailable")?;
         let network = gate
             .transition
             .lock()
@@ -230,6 +293,13 @@ pub fn socket_path(operator_socket: &Path) -> GuardResult<PathBuf> {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
     Cutoff { id: Uuid },
+    Terminate { id: Uuid },
+}
+
+fn unix_ns() -> GuardResult<u64> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+    )?)
 }
 
 pub fn serve(listener: UnixListener, fences: &Fences) {
@@ -244,9 +314,18 @@ pub fn serve(listener: UnixListener, fences: &Fences) {
         let response = (|| -> GuardResult<serde_json::Value> {
             configure(&stream)?;
             if peer_uid(&stream)? != 0 {
-                return Err("host root is required for emergency cutoff".into());
+                return Err("host root is required for emergency operations".into());
             }
-            let Request::Cutoff { id } = read_frame(&stream)?;
+            let id = match read_frame(&stream)? {
+                Request::Cutoff { id } => id,
+                Request::Terminate { id } => {
+                    return fences.emergency_terminate(
+                        id,
+                        |sandbox| sandbox.map_or(Ok(()), Sandbox::seal),
+                        || Libvirt::emergency_shutdown(id),
+                    );
+                }
+            };
             if !fences.is_registered(id)? {
                 return Err("unmanaged workload".into());
             }
@@ -254,13 +333,11 @@ pub fn serve(listener: UnixListener, fences: &Fences) {
                 if let Some(sandbox) = sandbox {
                     sandbox.seal()?;
                 }
-                let observed_at_unix_ns =
-                    u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos())?;
                 Ok(json!({
                     "id": id,
                     "admissions": "VERIFIED",
                     "broker_cutoff": "VERIFIED",
-                    "observed_at_unix_ns": observed_at_unix_ns,
+                    "observed_at_unix_ns": unix_ns()?,
                     "host_monotonic_ns": monotonic_ns()?,
                 }))
             })

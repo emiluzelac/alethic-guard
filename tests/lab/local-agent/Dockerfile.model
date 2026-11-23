@@ -1,0 +1,11 @@
+FROM ubuntu:24.04 AS build
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake ninja-build && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+ADD source.tar.gz /source/
+RUN cp -a /source/*/. . && cmake -S . -B /build -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF \
+    -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TOOLS=ON && \
+    cmake --build /build --target llama-completion --parallel 3
+FROM scratch
+COPY --from=build /build/bin/llama-completion /

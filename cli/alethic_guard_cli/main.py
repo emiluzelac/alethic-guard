@@ -13,6 +13,7 @@ from alethic_guard.policy import BackendCapabilities, compile_policy
 
 _MAX_FRAME = 65_536
 _EMERGENCY_TIMEOUT = 10
+_EMERGENCY_SHUTDOWN_TIMEOUT = 25
 
 
 def daemon_call(path: Path, request: dict, timeout: float = 140) -> dict:
@@ -57,10 +58,16 @@ def _workload(args: argparse.Namespace) -> dict:
                 if set(record) != {"idempotency_key", "payload_sha256"}:
                     raise ValueError("invalid controlled collector receipt")
                 request.update(key=record["idempotency_key"], payload_sha256=record["payload_sha256"])
-    if args.verb not in {"cutoff", "contain", "terminate"}:
+    if args.verb not in {"cutoff", "contain", "terminate", "emergency-terminate"}:
         return daemon_call(args.socket, request)
 
     emergency_socket = args.socket.with_name(args.socket.name + ".emergency")
+    if args.verb == "emergency-terminate":
+        return daemon_call(
+            emergency_socket,
+            {"command": "terminate", "id": request["id"]},
+            timeout=_EMERGENCY_SHUTDOWN_TIMEOUT,
+        )
     cutoff = {"command": "cutoff", "id": request["id"]}
     if args.verb == "cutoff":
         return daemon_call(emergency_socket, cutoff, timeout=_EMERGENCY_TIMEOUT)
@@ -116,7 +123,10 @@ def main(argv: list[str] | None = None) -> int:
     enroll.add_argument("--profile", required=True)
     enroll.add_argument("--image", required=True, help="approved image filename")
     enroll.add_argument("--input", help="approved raw input image filename")
-    for verb in ("start", "status", "verify", "pause", "resume", "cutoff", "contain", "terminate", "release"):
+    for verb in (
+        "start", "status", "verify", "pause", "resume", "cutoff", "contain",
+        "terminate", "emergency-terminate", "release",
+    ):
         workload.add_parser(verb).add_argument("id", type=uuid.UUID)
     for verb in ("effect-status", "reconcile-receipt"):
         command = workload.add_parser(verb)

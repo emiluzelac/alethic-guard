@@ -46,3 +46,18 @@ def test_terminate_runs_cleanup_when_emergency_socket_is_unavailable(tmp_path, m
     result = json.loads(capsys.readouterr().out)
     assert result["shutdown"] == "VERIFIED"
     assert result["emergency"] == {"broker_cutoff": "UNKNOWN", "error": "socket unavailable"}
+
+
+def test_emergency_terminate_uses_only_the_emergency_socket(tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def daemon_call(path, request, timeout):
+        calls.append((path.name, request))
+        return {"broker_cutoff": "VERIFIED", "shutdown": "UNKNOWN"}
+
+    monkeypatch.setattr(main, "daemon_call", daemon_call)
+    result = main.main(["--socket", str(tmp_path / "operator.sock"), "workload",
+                        "emergency-terminate", WORKLOAD])
+    assert result == 0
+    assert calls == [("operator.sock.emergency", {"command": "terminate", "id": WORKLOAD})]
+    assert json.loads(capsys.readouterr().out)["shutdown"] == "UNKNOWN"

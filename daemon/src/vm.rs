@@ -510,12 +510,47 @@ pub fn command_with_timeout(
 }
 
 fn virsh(args: &[&str], input: Option<&[u8]>) -> GuardResult<String> {
+    virsh_with_timeout("30s", args, input)
+}
+
+fn virsh_with_timeout(timeout: &str, args: &[&str], input: Option<&[u8]>) -> GuardResult<String> {
     let args: Vec<&OsStr> = ["-c", "qemu:///system"]
         .into_iter()
         .chain(args.iter().copied())
         .map(OsStr::new)
         .collect();
-    command("/usr/bin/virsh", &args, input)
+    command_with_timeout(timeout, "/usr/bin/virsh", &args, input)
+}
+
+impl Libvirt {
+    pub fn emergency_shutdown(id: Uuid) -> GuardResult<bool> {
+        let uuid = id.to_string();
+        let listed = || -> GuardResult<bool> {
+            let list = virsh_with_timeout("2s", &["list", "--all", "--uuid"], None)?;
+            Ok(list.lines().any(|line| line.trim() == uuid))
+        };
+        if listed()? {
+            let info = virsh_with_timeout("2s", &["dominfo", &uuid], None)?;
+            let name = format!("guard-{uuid}");
+            let matches = |key, expected| {
+                info.lines().any(|line| {
+                    line.split_once(':')
+                        .is_some_and(|(label, value)| label == key && value.trim() == expected)
+                })
+            };
+            if !matches("Name", name.as_str())
+                || !matches("UUID", uuid.as_str())
+                || !matches("Persistent", "no")
+            {
+                return Err("cannot verify the managed transient VM identity".into());
+            }
+            let _ = virsh_with_timeout("3s", &["destroy", &uuid], None);
+            if listed()? {
+                return Ok(false);
+            }
+        }
+        qemu_process_absent(id)
+    }
 }
 
 impl Hypervisor for Libvirt {
@@ -566,34 +601,38 @@ impl Hypervisor for Libvirt {
         if self.state(id)? != VmState::Absent {
             return Ok(false);
         }
-        let uuid = id.to_string();
-        for entry in std::fs::read_dir("/proc")? {
-            let entry = entry?;
-            if !entry
-                .file_name()
-                .as_encoded_bytes()
-                .iter()
-                .all(u8::is_ascii_digit)
-            {
-                continue;
-            }
-            let cmd = match std::fs::read(entry.path().join("cmdline")) {
-                Ok(buf) => buf,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err.into()),
-            };
-            let args: Vec<_> = cmd.split(|byte| *byte == 0).collect();
-            if args.first().is_some_and(|path| {
-                path.rsplit(|byte| *byte == b'/').next() == Some(b"qemu-system-x86_64")
-            }) && args
-                .windows(2)
-                .any(|arg| arg == [b"-uuid", uuid.as_bytes()])
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        qemu_process_absent(id)
     }
+}
+
+fn qemu_process_absent(id: Uuid) -> GuardResult<bool> {
+    let uuid = id.to_string();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let cmd = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(buf) => buf,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        let args: Vec<_> = cmd.split(|byte| *byte == 0).collect();
+        if args.first().is_some_and(|path| {
+            path.rsplit(|byte| *byte == b'/').next() == Some(b"qemu-system-x86_64")
+        }) && args
+            .windows(2)
+            .any(|arg| arg == [b"-uuid", uuid.as_bytes()])
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub fn validate_base_image(path: &Path) -> GuardResult<()> {

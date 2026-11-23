@@ -94,3 +94,63 @@ fn host_cutoff_is_attempted_even_when_marker_persistence_fails() {
     assert!(attempted);
     assert!(fences.with_open(id, || Ok(())).is_err());
 }
+
+#[test]
+fn emergency_shutdown_fences_admissions_before_observing_the_vm() {
+    let directory = tempdir().unwrap();
+    let fences = Fences::new(directory.path().to_path_buf());
+    let id = Uuid::new_v4();
+    fences.register(id).unwrap();
+
+    let outcome = fences
+        .emergency_terminate(
+            id,
+            |_| Ok(()),
+            || {
+                assert!(directory.path().join(id.to_string()).is_file());
+                assert!(fences.with_open(id, || Ok(())).is_err());
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(outcome["broker_cutoff"], "VERIFIED");
+    assert_eq!(outcome["shutdown"], "VERIFIED");
+    assert!(fences.guest_operation(id, || Ok(())).is_err());
+}
+
+#[test]
+fn unavailable_shutdown_observation_preserves_the_admission_fence() {
+    let directory = tempdir().unwrap();
+    let fences = Fences::new(directory.path().to_path_buf());
+    let id = Uuid::new_v4();
+    fences.register(id).unwrap();
+
+    let outcome = fences
+        .emergency_terminate(id, |_| Ok(()), || Err("hypervisor unavailable".into()))
+        .unwrap();
+    assert_eq!(outcome["admissions"], "VERIFIED");
+    assert_eq!(outcome["shutdown"], "UNKNOWN");
+    assert!(fences.with_open(id, || Ok(())).is_err());
+}
+
+#[test]
+fn emergency_shutdown_cannot_report_absence_during_a_guest_transition() {
+    let directory = tempdir().unwrap();
+    let fences = Fences::new(directory.path().to_path_buf());
+    let id = Uuid::new_v4();
+    fences.register(id).unwrap();
+
+    let result = fences
+        .guest_operation(id, || {
+            fences.emergency_terminate(
+                id,
+                |_| Ok(()),
+                || panic!("must acquire guest transition before observing shutdown"),
+            )
+        })
+        .unwrap();
+    assert_eq!(result["broker_cutoff"], "VERIFIED");
+    assert_eq!(result["shutdown"], "UNKNOWN");
+    assert!(fences.guest_operation(id, || Ok(())).is_err());
+    assert!(fences.guest_operation(Uuid::new_v4(), || Ok(())).is_ok());
+}

@@ -416,8 +416,13 @@ fn handle(
         }
         Request::Start { id } => {
             lifecycle.status(id)?.ok_or("unmanaged workload")?;
-            fences.with_open(id, || Ok(()))?;
-            let row = lifecycle.start(id, |row| config.overlay(row))?;
+            let row = fences.guest_operation(id, || {
+                lifecycle.start_guarded(
+                    id,
+                    |row| config.overlay(row),
+                    || fences.with_open(id, || Ok(())),
+                )
+            })?;
             attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_STARTED", "VERIFIED")))
         }
@@ -447,7 +452,7 @@ fn handle(
             let row = lifecycle.status(id)?.ok_or("unmanaged workload")?;
             fences.with_open(id, || Ok(()))?;
             config.validate_enrolled(&row)?;
-            let row = lifecycle.resume(id)?;
+            let row = fences.guest_operation(id, || lifecycle.resume(id))?;
             attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_RESUMED", "VERIFIED")))
         }

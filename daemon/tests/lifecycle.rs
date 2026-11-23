@@ -257,3 +257,26 @@ fn test_disappearance_during_cutoff_requires_independent_process_confirmation() 
     assert_eq!(report.shutdown, Observation::Failed);
     assert_eq!(report.mode, Mode::Containing);
 }
+
+#[test]
+fn an_admission_fence_closed_while_paused_prevents_vm_resume() {
+    let mut registry = Registry::memory().unwrap();
+    let vm = FakeVm::default();
+    let item = enrolled();
+    registry.enroll(&item).unwrap();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    let result = lifecycle.start_guarded(item.id, launch, || {
+        if vm.state(item.id)? == VmState::Paused {
+            return Err("emergency fence closed after paused start".into());
+        }
+        Ok(())
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("emergency fence closed")
+    );
+    assert_eq!(vm.resume_calls.get(), 0);
+    assert_eq!(vm.state(item.id).unwrap(), VmState::Absent);
+}

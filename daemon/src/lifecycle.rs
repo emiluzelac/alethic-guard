@@ -238,6 +238,15 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         id: Uuid,
         provision: impl FnOnce(&Workload) -> GuardResult<LaunchDisks>,
     ) -> GuardResult<Workload> {
+        self.start_guarded(id, provision, || Ok(()))
+    }
+
+    pub fn start_guarded(
+        &mut self,
+        id: Uuid,
+        provision: impl FnOnce(&Workload) -> GuardResult<LaunchDisks>,
+        admit: impl Fn() -> GuardResult<()>,
+    ) -> GuardResult<Workload> {
         let mut item = self.known(id)?;
         if item.mode != Mode::Ready || !self.vm.verify_absent(id)? {
             return Err("workload requires an explicit release or is already active".into());
@@ -254,15 +263,18 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
             item.runtime_base = Some(disks.base);
             item.runtime_input = disks.input;
             self.registry.save(&item)?;
+            admit()?;
             self.vm.create_paused(&item.domain()?)?;
             if self.vm.state(id)? != VmState::Paused {
                 return Err("domain did not start paused".into());
             }
             self.verify_active(&item)?;
+            admit()?;
             self.vm.resume(id)?;
             if self.vm.state(id)? != VmState::Running {
                 return Err("domain failed to reach running state".into());
             }
+            admit()?;
             item.mode = Mode::Running;
             self.registry.save(&item)
         })();

@@ -18,7 +18,7 @@ Use the real host and guest test procedures in [the lab instructions](../tests/l
 
 Production security claims require independently reproduced evidence and an independent security assessment for the supported configuration. The source-commit wheel used in development is a separate qualification artifact from a published PyPI release.
 
-The validated host and runtime versions bound the qualification. The emergency socket reports broker admission and network cutoff. The normal operator socket provides separate guest and hypervisor observations and records containment and termination in the journal.
+The validated host and runtime versions bound the qualification. The emergency socket reports broker admission and network cutoff. Its emergency termination command additionally reports an independent VM shutdown observation. The normal operator socket records containment and termination in the journal.
 
 ## Planned local agent qualification for v0.3.0
 

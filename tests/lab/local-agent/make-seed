@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -ne 4 ]; then
+    echo "usage: make-seed SCRATCH OUTPUT_IMAGE LLAMA_COMPLETION MODEL_GGUF" >&2
+    exit 2
+fi
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+scratch=$1
+output=$2
+test ! -e "$output"
+mkdir -p "$scratch"
+install -m 0555 "$3" "$scratch/llama-completion"
+install -m 0444 "$4" "$scratch/model.gguf"
+install -m 0444 "$root/agent.py" "$scratch/agent.py"
+printf '%s\n' 'The Atlas backup window starts at 14:00 UTC. The owner of the backup is Dana.' >"$scratch/maintenance.txt"
+printf '%s\n' 'instance-id: alethic-guard-local-agent' 'local-hostname: guard-local-agent' >"$scratch/meta-data"
+cat >"$scratch/user-data" <<'CONFIG'
+#cloud-config
+runcmd:
+  - [sh, -ec, "install -d -m 0755 /mnt/guard-agent && mount -o ro LABEL=cidata /mnt/guard-agent"]
+  - [sh, -ec, "chgrp nogroup /dev/virtio-ports/dev.alethic.guard.1 && chmod 0660 /dev/virtio-ports/dev.alethic.guard.1"]
+  - [sh, -c, "timeout 140 runuser -u nobody -- python3 -I /mnt/guard-agent/agent.py > /dev/ttyS0 2>&1"]
+CONFIG
+genisoimage -quiet -volid cidata -joliet -rock -o "$output" "$scratch"
