@@ -245,13 +245,17 @@ impl Registry {
         if item.enrollment.id != id {
             return Err("registry enrollment identity mismatch".into());
         }
-        let observe = |step: &str, result: GuardResult<bool>| match result {
-            Ok(true) => Observation::Verified,
-            Ok(false) => Observation::Failed,
-            Err(error) => {
-                eprintln!("host recovery {step} for {id}: {error}");
-                Observation::Unknown
-            }
+        let observe = |step: &str, result: GuardResult<bool>| {
+            let status = match result {
+                Ok(true) => Observation::Verified,
+                Ok(false) => Observation::Failed,
+                Err(error) => {
+                    eprintln!("host recovery {step} for {id}: {error}");
+                    Observation::Unknown
+                }
+            };
+            eprintln!("host recovery {step} for {id} = {}", status.as_str());
+            status
         };
         let (intent, admissions, broker_cutoff, shutdown) = std::thread::scope(|scope| {
             // The daemon lock prevents new effects during offline recovery.
@@ -502,10 +506,10 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
 
     pub fn resume(&mut self, id: Uuid) -> GuardResult<Workload> {
         let mut item = self.known(id)?;
-        if item.mode != Mode::Paused || self.vm.state(id)? != VmState::Paused {
+        if item.mode != Mode::Paused {
             return Err("resume requires a verified paused workload".into());
         }
-        if self.verify_active(&item).is_err() {
+        if self.vm.state(id).ok() != Some(VmState::Paused) || self.verify_active(&item).is_err() {
             self.contain(id, true)?;
             return Err("unable to verify the paused domain".into());
         }

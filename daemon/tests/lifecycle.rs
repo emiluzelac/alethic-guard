@@ -149,6 +149,22 @@ fn failed_resume_record_stops_the_vm() {
 }
 
 #[test]
+fn resume_contains_a_vm_that_disagrees_with_its_recorded_pause() {
+    let mut registry = Registry::memory().unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let vm = FakeVm::default();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(id, launch).unwrap();
+    lifecycle.pause(id).unwrap();
+    vm.state.set(Some(VmState::Running));
+    assert!(lifecycle.resume(id).is_err());
+    assert!(vm.verify_absent(id).unwrap());
+    assert_eq!(registry.get(id).unwrap().unwrap().mode, Mode::Terminated);
+}
+
+#[test]
 fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
     let mut registry = Registry::memory().unwrap();
     let enrollment = enrolled();

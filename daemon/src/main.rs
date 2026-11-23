@@ -421,6 +421,7 @@ fn handle(
         }
         Request::Start { id } => {
             lifecycle.status(id)?.ok_or("unmanaged workload")?;
+            fences.with_open(id, || Ok(()))?;
             let row = lifecycle.start_guarded(
                 id,
                 |row| config.overlay(row),
