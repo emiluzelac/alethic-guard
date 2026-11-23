@@ -14,7 +14,7 @@ If the response to an operator release is lost, query `workload status ID` to ob
 
 Terminate applies containment and asks the hypervisor to stop the VM. Guard checks both the hypervisor and host process state before reporting shutdown. If an observer fails or a transition is interrupted, Guard keeps the durable containment state and reports the affected boundary as unknown.
 
-A gateway rechecks authority before opening the TLS connection and before writing the authorized request. The revocation barrier is the verified host cutoff after fencing. Data already past that boundary may reach the collector. Use the emergency response for the host network observation and the normal containment or termination response for the hypervisor observation.
+A gateway rechecks authority before opening the TLS connection and before writing the authorized request. The revocation barrier is the verified host cutoff after fencing. Data already past that boundary may reach the collector. The `cutoff` response records the network observation. The `emergency-terminate` response also records the VM shutdown observation. Ordinary termination reconciles the registry and journal afterward.
 
 An effect journal entry records the durable redemption transaction. A transaction already underway can commit while cutoff installs the host deny. Guard checks the fence again before returning transport authority, and the host network cutoff covers a request that already had authority.
 

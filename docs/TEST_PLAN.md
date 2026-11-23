@@ -31,3 +31,15 @@ Run a pinned open-weight CPU model inside an enrolled VM. Record the model and g
 | Ordinary operator queue is stalled during an active workload | The emergency operation fences admission and stops the exact enrolled VM within a documented timeout. Independent host observations corroborate shutdown, and restart requires operator release. |
 | Shutdown observation is unavailable | The emergency operation reports the shutdown as unknown while preserving the admission fence. |
 | Independent reproduction | A second operator runs the procedures from the tagged source and checksummed archive. The published results identify those exact inputs and include sanitized observations and verification of a checkpoint retained off-host. |
+
+## Proposed qualification for v0.4.0
+
+Use the v0.3.0 measurement as a reference case. Run repeated tests in a disposable lab with resource limits.
+
+| Case | Evidence to collect |
+| --- | --- |
+| Repeated emergency shutdown with an idle queue, concurrent workloads, and CPU contention | Record the sample count, median, p95, and p99 of verified shutdown latency for each case. Count failed observations, unknown outcomes, and timeouts separately. Confirm the verified target identity and absence of the enrolled VM and QEMU process. |
+| Unavailable hypervisor observer or failure to persist the fence | Record separate admission, broker, and shutdown outcomes. Verify each available observation directly. Test recovery and confirm that an interrupted operation requires reconciliation before a fresh start. |
+| Synthetic instruction tests at the guest boundary | Use fixed inputs that request disallowed actions. Check each supported tool and output channel against its declared policy using synthetic markers, controlled receivers, and host observations. Record the guest serial console as a host-visible output. |
+| Guard daemon unavailable | Exercise a host-operator recovery procedure that can fence broker access and stop the identified enrolled VM while Guard is unavailable. Check the network and VM state directly. On restart, verify reconciliation and the operator-release requirement. |
+| Independent qualification and review | A separate reviewer installs the tagged archive, checks its checksum, reproduces the cases, and records any differences in runtime configuration or results. Retain and verify checkpoints off-host. |
