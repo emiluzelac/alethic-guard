@@ -23,7 +23,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -36,6 +36,7 @@ struct WorkloadGate {
     generation: AtomicU64,
     transition: Mutex<NetworkState>,
     guest: Mutex<()>,
+    pending_shutdown: AtomicBool,
 }
 
 struct NetworkState {
@@ -88,10 +89,19 @@ impl Drop for WorkerPermit {
     }
 }
 
+struct PendingShutdown(Arc<WorkloadGate>);
+
+impl Drop for PendingShutdown {
+    fn drop(&mut self) {
+        self.0.pending_shutdown.store(false, Ordering::Release);
+    }
+}
+
 pub struct Fences {
     root: PathBuf,
     gates: Mutex<HashMap<Uuid, Arc<WorkloadGate>>>,
     cutoff_workers: Arc<AtomicUsize>,
+    shutdown_workers: Arc<AtomicUsize>,
 }
 
 impl Fences {
@@ -100,6 +110,7 @@ impl Fences {
             root,
             gates: Mutex::new(HashMap::new()),
             cutoff_workers: Arc::new(AtomicUsize::new(0)),
+            shutdown_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -124,6 +135,7 @@ impl Fences {
                     sandbox: None,
                 }),
                 guest: Mutex::new(()),
+                pending_shutdown: AtomicBool::new(false),
             })
         })))
     }
@@ -262,7 +274,7 @@ impl Fences {
         &self,
         id: Uuid,
         cut: impl FnOnce(Option<Sandbox>) -> GuardResult<()> + Send + 'static,
-        stop: impl FnOnce() -> GuardResult<bool>,
+        stop: impl FnOnce() -> GuardResult<bool> + Send + 'static,
     ) -> GuardResult<serde_json::Value> {
         let gate = self.registered_gate(id)?.ok_or("unmanaged workload")?;
         // Even a stuck start or resume must not delay fencing broker admissions.
@@ -270,15 +282,9 @@ impl Fences {
         let cutoff = self.background_cutoff(id, Arc::clone(&gate), cut)?;
         // Keep the transition guard through both observation timestamps.
         let shutdown = if guest.is_some() {
-            match stop() {
-                Ok(true) => Observation::Verified,
-                Ok(false) => Observation::Failed,
-                Err(error) => {
-                    eprintln!("emergency VM shutdown for {id}: {error}");
-                    Observation::Unknown
-                }
-            }
+            Self::observe_shutdown(id, stop)
         } else {
+            self.finish_pending_shutdown(id, Arc::clone(&gate), stop);
             Observation::Unknown
         };
         let fenced = cutoff
@@ -294,6 +300,40 @@ impl Fences {
         }))
     }
 
+    fn observe_shutdown(id: Uuid, stop: impl FnOnce() -> GuardResult<bool>) -> Observation {
+        match stop() {
+            Ok(true) => Observation::Verified,
+            Ok(false) => Observation::Failed,
+            Err(error) => {
+                eprintln!("emergency VM shutdown for {id}: {error}");
+                Observation::Unknown
+            }
+        }
+    }
+
+    fn finish_pending_shutdown(
+        &self,
+        id: Uuid,
+        gate: Arc<WorkloadGate>,
+        stop: impl FnOnce() -> GuardResult<bool> + Send + 'static,
+    ) {
+        let Some(permit) = WorkerPermit::acquire(&self.shutdown_workers, 8) else {
+            return;
+        };
+        if gate.pending_shutdown.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let pending = PendingShutdown(gate);
+        if let Err(error) = thread::Builder::new().spawn(move || {
+            let (_permit, pending) = (permit, pending);
+            if let Ok(_guest) = pending.0.guest.lock() {
+                Self::observe_shutdown(id, stop);
+            }
+        }) {
+            eprintln!("starting pending VM shutdown for {id}: {error}");
+        }
+    }
+
     pub fn release<T>(&self, id: Uuid, run: impl FnOnce() -> GuardResult<T>) -> GuardResult<T> {
         let gate = self
             .gates
@@ -304,6 +344,9 @@ impl Fences {
             .ok_or("unmanaged workload")?;
         let version = gate.generation();
         let result = run()?;
+        if gate.pending_shutdown.load(Ordering::Acquire) {
+            return Err("an emergency VM shutdown is pending".into());
+        }
         let _guest = gate
             .guest
             .lock()
@@ -315,7 +358,9 @@ impl Fences {
         let released = version
             .checked_add(version % 2)
             .ok_or("release generation exhausted")?;
-        if gate.generation() != version || (version % 2 == 1 && network.completed_cutoff != version)
+        if gate.pending_shutdown.load(Ordering::Acquire)
+            || gate.generation() != version
+            || (version % 2 == 1 && network.completed_cutoff != version)
         {
             return Err("a newer emergency cutoff interrupted release".into());
         }
@@ -380,7 +425,8 @@ fn handle(mut stream: UnixStream, fences: &Fences) {
         let id = match read_frame(&stream)? {
             Request::Cutoff { id } => id,
             Request::Terminate { id } => {
-                return fences.emergency_terminate(id, cut, || Libvirt::emergency_shutdown(id));
+                return fences
+                    .emergency_terminate(id, cut, move || Libvirt::emergency_shutdown(id));
             }
         };
         let gate = fences.registered_gate(id)?.ok_or("unmanaged workload")?;

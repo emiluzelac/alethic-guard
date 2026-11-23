@@ -1,5 +1,6 @@
 use crate::{
     GuardResult,
+    emergency::Fences,
     evidence::{self, EventFields},
     vm::{DomainSpec, Hypervisor, VmState, verify_domain},
 };
@@ -237,7 +238,7 @@ impl Registry {
     pub fn recover_host(
         &mut self,
         id: Uuid,
-        fence: impl FnOnce(Uuid) -> GuardResult<()>,
+        fence: impl FnOnce(Uuid) -> GuardResult<()> + Send,
         stop: impl FnOnce(Uuid) -> GuardResult<bool> + Send,
     ) -> GuardResult<HostRecoveryReport> {
         let mut item = self.get(id)?.ok_or("unknown workload")?;
@@ -256,12 +257,13 @@ impl Registry {
             // The daemon lock prevents new effects during offline recovery.
             // Start VM shutdown even if storage or network cleanup stalls.
             let vm = scope.spawn(move || observe("shutdown", stop(id)));
-            let intent = item.begin_containment(true).and_then(|()| self.save(&item));
-            let admissions = observe("admissions fence", fence(id).map(|()| true));
+            let fence = scope.spawn(move || observe("admissions fence", fence(id).map(|()| true)));
             let broker_cutoff = observe(
                 "broker cutoff",
                 crate::broker::stop(self, Some(id)).map(|()| true),
             );
+            let intent = item.begin_containment(true).and_then(|()| self.save(&item));
+            let admissions = fence.join().unwrap_or(Observation::Unknown);
             let shutdown = vm.join().unwrap_or(Observation::Unknown);
             (intent, admissions, broker_cutoff, shutdown)
         });
@@ -317,11 +319,28 @@ enum ActiveBoundary {
 pub struct Lifecycle<'a, H> {
     registry: &'a mut Registry,
     vm: &'a H,
+    fences: Option<&'a Fences>,
 }
 
 impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     pub fn new(registry: &'a mut Registry, vm: &'a H) -> Self {
-        Self { registry, vm }
+        Self {
+            registry,
+            vm,
+            fences: None,
+        }
+    }
+
+    pub fn with_fences(mut self, fences: &'a Fences) -> Self {
+        self.fences = Some(fences);
+        self
+    }
+
+    fn guest_mutation(&self, id: Uuid, run: impl FnOnce() -> GuardResult<()>) -> GuardResult<()> {
+        match self.fences {
+            Some(fences) => fences.guest_operation(id, run),
+            None => run(),
+        }
     }
 
     pub fn status(&self, id: Uuid) -> GuardResult<Option<Workload>> {
@@ -386,14 +405,19 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
             item.runtime_base = Some(disks.base);
             item.runtime_input = disks.input;
             self.registry.save(&item)?;
-            admit()?;
-            self.vm.create_paused(&item.domain()?)?;
+            let domain = item.domain()?;
+            self.guest_mutation(id, || {
+                admit()?;
+                self.vm.create_paused(&domain)
+            })?;
             if self.vm.state(id)? != VmState::Paused {
                 return Err("domain did not start paused".into());
             }
             self.verify_active(&item)?;
-            admit()?;
-            self.vm.resume(id)?;
+            self.guest_mutation(id, || {
+                admit()?;
+                self.vm.resume(id)
+            })?;
             if self.vm.state(id)? != VmState::Running {
                 return Err("domain failed to reach running state".into());
             }
@@ -487,7 +511,9 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         }
         item.mode = Mode::Starting;
         self.registry.save(&item)?;
-        if self.vm.resume(id).is_err() || self.vm.state(id).ok() != Some(VmState::Running) {
+        if self.guest_mutation(id, || self.vm.resume(id)).is_err()
+            || self.vm.state(id).ok() != Some(VmState::Running)
+        {
             self.contain(id, true)?;
             return Err("unable to verify the resumed domain".into());
         }

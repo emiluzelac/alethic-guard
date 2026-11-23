@@ -197,6 +197,10 @@ def main(output):
             "ip", "netns", "exec", "guard-release-collector", sys.executable,
             "-m", "http.server", "--bind", "fd42:abcd::2", "--directory", "/lab/empty", "9080",
         ])
+        until(lambda: subprocess.check_output([
+            "ip", "netns", "exec", "guard-release-collector",
+            "ss", "-H", "-ltn", "( sport = :9080 )",
+        ], text=True).strip(), "lab listener binding")
         trace = output / "network-denial.pcap"
         capture = launch("packet-capture", [
             "tcpdump", "-n", "-U", "-i", "guard-observe", "-w", str(trace),
@@ -214,7 +218,7 @@ def main(output):
                 return False
             finally:
                 client.close()
-        until(calibrated, "lab listener calibration")
+        assert calibrated(), "lab listener calibration"
 
         first = save("enrolled", call(*ordinary("create", FIXTURE)))
         id = first["enrollment"]["id"]

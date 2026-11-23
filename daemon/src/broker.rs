@@ -355,6 +355,7 @@ fn stop_with(
     mut stop_helpers: impl FnMut(Sandbox) -> GuardResult<()>,
 ) -> GuardResult<()> {
     let mut failures = Vec::new();
+    let mut observed = Vec::new();
     for slot in registry.cutoff_slots(id)? {
         let slot = match slot {
             Ok(slot) => slot,
@@ -363,17 +364,19 @@ fn stop_with(
                 continue;
             }
         };
-        let persist = registry.set_gateway_slot(slot, false, false);
         let result = Sandbox::new(slot).and_then(|sandbox| {
             let cutoff = seal(sandbox);
             let stopped = stop_helpers(sandbox);
-            cutoff?;
-            stopped?;
-            persist?;
-            registry.set_gateway_slot(slot, false, true)
+            cutoff.and(stopped)
         });
+        observed.push((slot, result.is_ok()));
         if let Err(error) = result {
             failures.push(format!("gateway slot {slot}: {error}"));
+        }
+    }
+    for (slot, retired) in observed {
+        if let Err(error) = registry.set_gateway_slot(slot, false, retired) {
+            failures.push(format!("recording gateway slot {slot}: {error}"));
         }
     }
     if !failures.is_empty() {

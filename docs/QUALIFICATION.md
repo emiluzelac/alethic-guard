@@ -1,5 +1,9 @@
 # Alethic Guard release qualification
 
+## Version 0.4.0
+
+Use the v0.4.0 evidence package to match the qualified archive SHA-256, source commit, runtime, and guest digests. The package includes the recorded shutdown distribution, installed-service and recovery observations, controlled local-model results, and instructions for checking the retained journal checkpoint. [v0.4.0 evidence](https://github.com/emiluzelac/alethic-guard/tree/release-assets/v0.4.0)
+
 ## Version 0.3.0
 
 The local-agent lab uses physical Intel KVM with Ubuntu 24.04.5 x86-64, Linux `7.0.0-42-generic`, libvirt `10.0.0-2ubuntu8.19`, and QEMU `1:8.2.2+ds-0ubuntu1.18`. The test runs in disposable Ubuntu userspace with private networking and an AppArmor override for container namespace mounts. The enrolled guest uses one CPU and 1 GiB of RAM.

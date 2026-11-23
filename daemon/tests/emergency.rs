@@ -98,16 +98,17 @@ fn host_cutoff_is_attempted_even_when_marker_persistence_fails() {
 #[test]
 fn emergency_shutdown_fences_admissions_before_observing_the_vm() {
     let directory = tempdir().unwrap();
-    let fences = Fences::new(directory.path().to_path_buf());
+    let fences = Arc::new(Fences::new(directory.path().to_path_buf()));
     let id = Uuid::new_v4();
     fences.register(id).unwrap();
+    let observed = Arc::clone(&fences);
 
     let outcome = fences
         .emergency_terminate(
             id,
             |_| Ok(()),
-            || {
-                assert!(fences.with_open(id, || Ok(())).is_err());
+            move || {
+                assert!(observed.with_open(id, || Ok(())).is_err());
                 Ok(true)
             },
         )
@@ -135,7 +136,7 @@ fn emergency_shutdown_proceeds_while_broker_cutoff_is_stalled() {
                     release_cut.recv_timeout(Duration::from_secs(6)).unwrap();
                     Ok(())
                 },
-                || {
+                move || {
                     stopped.send(()).unwrap();
                     Ok(true)
                 },
@@ -180,18 +181,25 @@ fn emergency_shutdown_cannot_report_absence_during_a_guest_transition() {
     let fences = Fences::new(directory.path().to_path_buf());
     let id = Uuid::new_v4();
     fences.register(id).unwrap();
+    let (pending, stopped) = mpsc::channel();
 
     let result = fences
         .guest_operation(id, || {
-            fences.emergency_terminate(
+            let report = fences.emergency_terminate(
                 id,
                 |_| Ok(()),
-                || panic!("must acquire guest transition before observing shutdown"),
-            )
+                move || {
+                    pending.send(()).unwrap();
+                    Ok(true)
+                },
+            )?;
+            assert!(stopped.try_recv().is_err());
+            Ok(report)
         })
         .unwrap();
     assert_eq!(result["broker_cutoff"], "VERIFIED");
     assert_eq!(result["shutdown"], "UNKNOWN");
+    stopped.recv_timeout(Duration::from_secs(2)).unwrap();
     assert!(fences.guest_operation(id, || Ok(())).is_err());
     assert!(fences.guest_operation(Uuid::new_v4(), || Ok(())).is_ok());
 }

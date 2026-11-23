@@ -83,6 +83,7 @@ enum Request {
         id: Uuid,
         generation: u64,
         pid: u32,
+        start_time: u64,
     },
     EffectStatus {
         id: Uuid,
@@ -332,12 +333,15 @@ fn attach_gateway(
     let collector = config.collector.as_ref().ok_or("gateway disabled")?;
     match broker::start(registry, item, collector, &config.socket, fences) {
         Ok(mut child) => {
-            if let Err(error) = registry.bind_gateway_process(item, child.id()) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = Lifecycle::new(registry, &Libvirt).contain(item.enrollment.id, true);
-                return Err(error);
-            }
+            let start_time = match registry.bind_gateway_process(item, child.id()) {
+                Ok(start_time) => start_time,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = Lifecycle::new(registry, &Libvirt).contain(item.enrollment.id, true);
+                    return Err(error);
+                }
+            };
             let socket = config.socket.clone();
             let id = item.enrollment.id;
             let generation = item.generation;
@@ -349,7 +353,8 @@ fn attach_gateway(
                         configure(&stream)?;
                         write_frame(
                             &mut stream,
-                            &json!({"command":"reap_gateway","id":id,"generation":generation,"pid":pid}),
+                            &json!({"command":"reap_gateway","id":id,"generation":generation,
+                                    "pid":pid,"start_time":start_time}),
                         )?;
                         Ok(())
                     })();
@@ -379,7 +384,7 @@ fn handle(
         return broker_request(req, registry, config, uid, fences);
     }
     let vm = Libvirt;
-    let mut lifecycle = Lifecycle::new(registry, &vm);
+    let mut lifecycle = Lifecycle::new(registry, &vm).with_fences(fences);
     let (result, event) = match req {
         Request::Create {
             profile,
@@ -416,13 +421,11 @@ fn handle(
         }
         Request::Start { id } => {
             lifecycle.status(id)?.ok_or("unmanaged workload")?;
-            let row = fences.guest_operation(id, || {
-                lifecycle.start_guarded(
-                    id,
-                    |row| config.overlay(row),
-                    || fences.with_open(id, || Ok(())),
-                )
-            })?;
+            let row = lifecycle.start_guarded(
+                id,
+                |row| config.overlay(row),
+                || fences.with_open(id, || Ok(())),
+            )?;
             attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_STARTED", "VERIFIED")))
         }
@@ -452,14 +455,16 @@ fn handle(
             let row = lifecycle.status(id)?.ok_or("unmanaged workload")?;
             fences.with_open(id, || Ok(()))?;
             config.validate_enrolled(&row)?;
-            let row = fences.guest_operation(id, || lifecycle.resume(id))?;
+            let row = lifecycle.resume(id)?;
             attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_RESUMED", "VERIFIED")))
         }
         Request::Contain { id } | Request::Terminate { id } => {
             let terminate = matches!(req, Request::Terminate { .. });
             lifecycle.status(id)?.ok_or("unmanaged workload")?;
-            let latched = fences.cutoff(id, |_| Ok(()));
+            let latched = fences.cutoff(id, |sandbox| {
+                sandbox.map_or(Ok(()), alethic_guardd::network::Sandbox::seal)
+            });
             let report = lifecycle.contain(id, terminate)?;
             latched?;
             let mode = if terminate {
@@ -501,8 +506,9 @@ fn handle(
             id,
             generation,
             pid,
+            start_time,
         } => {
-            if registry.has_active_gateway_process(id, generation, pid)? {
+            if registry.has_active_gateway_process(id, generation, pid, start_time)? {
                 let report = Lifecycle::new(registry, &vm).contain(id, false)?;
                 let status = report.broker_cutoff.as_str();
                 (json!(report), Some((id, "GATEWAY_EXIT_OBSERVED", status)))
@@ -530,7 +536,15 @@ fn handle(
         _ => return Err("broker operations require a bound gateway identity".into()),
     };
     if let Some((id, event_type, status)) = event {
-        registry.record_host_observation(id, event_type, status)?;
+        if let Err(error) = registry.record_host_observation(id, event_type, status) {
+            if matches!(event_type, "WORKLOAD_STARTED" | "WORKLOAD_RESUMED") {
+                let _ = fences.cutoff(id, |sandbox| {
+                    sandbox.map_or(Ok(()), alethic_guardd::network::Sandbox::seal)
+                });
+                let _ = Lifecycle::new(registry, &vm).contain(id, true);
+            }
+            return Err(error);
+        }
     }
     Ok(result)
 }
@@ -674,7 +688,7 @@ fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
     Ok(())
 }
 
-fn serve(config: Config) -> GuardResult<()> {
+fn serve(mut config: Config, collector_path: Option<(&Path, bool)>) -> GuardResult<()> {
     require_root()?;
     for directory in [
         &config.data,
@@ -703,11 +717,26 @@ fn serve(config: Config) -> GuardResult<()> {
     secure_directory(&artifacts)?;
     alethic_guardd::artifact::restrict_to_emulator(&artifacts, config.emulator_uid)?;
     let mut registry = Registry::open(&state.join("guard.sqlite3"))?;
+    // A failed platform dependency must not delay attempts to stop VMs left
+    // running by an earlier daemon. The registry remains exclusively locked.
+    for enrollment in registry.all()? {
+        let id = enrollment.enrollment.id;
+        if let Err(error) = Libvirt::emergency_shutdown(id) {
+            eprintln!("startup VM shutdown for {id}: {error}");
+        }
+    }
     let cutoff = broker::stop(&mut registry, None);
     let reconciliation = Lifecycle::new(&mut registry, &Libvirt).reconcile();
     cutoff?;
     reconciliation?;
     registry.recover_effects()?;
+    if let Some((path, optional)) = collector_path {
+        config.collector = match fs::symlink_metadata(path) {
+            Ok(_) => Some(load_collector(path)?),
+            Err(error) if optional && error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+    }
 
     let fences = Arc::new(Fences::new(fence_directory(&state)?));
     // Startup closes every previous broker binding before serving either socket.
@@ -787,15 +816,10 @@ fn run() -> GuardResult<()> {
         return recover(id.to_str().ok_or("invalid workload ID")?.parse()?, dir);
     }
     let installed = matches!(args.as_slice(), [flag] if flag == "--installed");
-    let collector = if installed {
-        let path = Path::new("/etc/alethic-guard/collector.json");
-        match fs::symlink_metadata(path) {
-            Ok(_) => Some(load_collector(path)?),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        None
+    let collector_path = match args.as_slice() {
+        [_] if installed => Some((Path::new("/etc/alethic-guard/collector.json"), true)),
+        [_, _, _, collector] => Some((Path::new(collector), false)),
+        _ => None,
     };
     let emulator_uid = emulator_uid()?;
     let config =
@@ -804,21 +828,14 @@ fn run() -> GuardResult<()> {
                 data: "/var/lib/alethic-guard".into(),
                 policies: "/etc/alethic-guard/policies".into(),
                 socket: "/run/alethic-guard/operator.sock".into(),
-                collector,
+                collector: None,
                 emulator_uid,
             },
-            [data, policies, socket] => Config {
+            [data, policies, socket, ..] if args.len() <= 4 => Config {
                 data: data.into(),
                 policies: policies.into(),
                 socket: socket.into(),
                 collector: None,
-                emulator_uid,
-            },
-            [data, policies, socket, collector] => Config {
-                data: data.into(),
-                policies: policies.into(),
-                socket: socket.into(),
-                collector: Some(load_collector(Path::new(collector))?),
                 emulator_uid,
             },
             _ => return Err(
@@ -826,7 +843,7 @@ fn run() -> GuardResult<()> {
                     .into(),
             ),
         };
-    serve(config)
+    serve(config, collector_path)
 }
 
 fn main() -> std::process::ExitCode {
