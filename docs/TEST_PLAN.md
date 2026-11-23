@@ -10,7 +10,7 @@ Use the real host and guest test procedures in [the lab instructions](../tests/l
 | Forged role, workload ID, arbitrary target or forbidden fixture | Typed broker rejects it and the collector records zero corresponding effects. |
 | Exact allowed fixture, replay, stale epoch or permit | One collector effect permitted, with replays and stale requests rejected. |
 | Invalid TLS, redirect, or DNS resolution outside the configured address set | No redirection or unapproved connection. An already-sent request may have an unknown outcome. |
-| Containment before or during dispatch, including a stalled gateway | Host cutoff verified and new effects fenced. Already-passed bytes remain accounted for separately. |
+| Cutoff before or during dispatch, including a stalled gateway and a busy operator queue | Host cutoff verified while an ordinary request is still pending. Calibrated capture shows no broker egress after the observation. A collector receipt proves only what arrived before cutoff. |
 | Crash, reboot, or gateway loss | Admissions close, network rules remain effective, and managed domains do not autostart. |
 | Interrupted send or journal fault | No retry after an ambiguous send and no effect when the required admission record cannot be committed. |
 | Evidence altered or truncated | Local consistency or an independent checkpoint verification identifies the mismatch. |
@@ -18,6 +18,4 @@ Use the real host and guest test procedures in [the lab instructions](../tests/l
 
 Release only configurations with independently reproduced evidence and an independent security assessment. The source-commit wheel used in development is a separate qualification artifact from a published PyPI release.
 
-## Current preview limit
-
-The broker cutoff runs before hypervisor inspection once the daemon begins handling containment. The operator socket still shares its request loop with normal work. Public qualification requires a cutoff path that can preempt that queue and a live test of both cutoff race orderings.
+The validated host and runtime versions bound the qualification. The emergency socket reports broker admission and network cutoff. The normal operator socket provides separate guest and hypervisor observations and records containment and termination in the journal.

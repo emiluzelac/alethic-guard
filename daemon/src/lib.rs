@@ -3,6 +3,7 @@ pub mod auth;
 pub mod broker;
 pub mod collector;
 pub mod effect;
+pub mod emergency;
 pub mod evidence;
 pub mod gateway_process;
 pub mod lifecycle;

@@ -1,12 +1,13 @@
 """Controlled TLS endpoint for Guard qualification on a disconnected lab network."""
 
+import argparse
 import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 from pathlib import Path
 import socket
 import ssl
-import sys
+import time
 import uuid
 
 
@@ -41,6 +42,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(409)
                 return
             code = 200
+        self.server.pause_at("receipt")
         encoded = json.dumps(result).encode()
         self.send_response(code)
         self.send_header("Content-Length", str(len(encoded)))
@@ -52,12 +54,42 @@ class Handler(BaseHTTPRequestHandler):
 class Collector(HTTPServer):
     address_family = socket.AF_INET6
 
+    def pause_at(self, phase):
+        if self.phase != phase:
+            return
+        self.barrier.with_suffix(".ready").write_text(str(time.time_ns()))
+        deadline = time.monotonic() + 15
+        while not self.barrier.with_suffix(".continue").exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"lab barrier expired at {phase}")
+            time.sleep(0.01)
+
+    def get_request(self):
+        client, address = super().get_request()
+        try:
+            client.settimeout(18)
+            self.pause_at("handshake")
+            return self.context.wrap_socket(client, server_side=True), address
+        except Exception:
+            client.close()
+            raise
+
 
 if __name__ == "__main__":
-    port, cert, key, output = sys.argv[1:]
-    with Collector(("::", int(port)), Handler) as server:
-        server.receipts = Path(output)
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(cert, key)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("port", type=int)
+    parser.add_argument("cert")
+    parser.add_argument("key")
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--phase", choices=("handshake", "receipt"))
+    parser.add_argument("--barrier", type=Path)
+    args = parser.parse_args()
+    if bool(args.phase) != bool(args.barrier):
+        parser.error("--phase and --barrier must be used together")
+    with Collector(("::", args.port), Handler) as server:
+        server.receipts = args.output
+        server.phase = args.phase
+        server.barrier = args.barrier
+        server.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        server.context.load_cert_chain(args.cert, args.key)
         server.serve_forever()

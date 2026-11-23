@@ -5,6 +5,7 @@ use alethic_guardd::{
     collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest},
     digest_file,
     effect::{Action, Outcome},
+    emergency::{self, Fences},
     evidence,
     lifecycle::{Enrolled, LaunchDisks, Lifecycle, Registry, Workload},
     protocol::{configure, read_frame, write_frame},
@@ -24,6 +25,7 @@ use std::{
         },
     },
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
 };
 use uuid::Uuid;
@@ -259,6 +261,7 @@ fn broker_request(
     registry: &mut Registry,
     config: &Config,
     uid: u32,
+    fences: &Fences,
 ) -> GuardResult<Value> {
     let collector = config
         .collector
@@ -274,16 +277,19 @@ fn broker_request(
         req,
         Request::BrokerPrepare { .. } | Request::BrokerRedeem { .. } | Request::BrokerCheck { .. }
     ) {
+        fences.with_open(binding.id, || Ok(()))?;
         Lifecycle::new(registry, &Libvirt).require_running_boundary(binding.id)?;
     }
     match req {
-        Request::BrokerPrepare { request } => {
-            Ok(json!(broker::prepare(registry, collector, uid, request)?))
-        }
+        Request::BrokerPrepare { request } => Ok(json!(broker::prepare(
+            registry, collector, uid, request, fences
+        )?)),
         Request::BrokerRedeem { nonce, action } => {
             let session = broker::controller_session(collector)?;
             registry.authenticate_controller_session(nonce, session)?;
-            registry.redeem_grant(nonce, &action, uid, evidence::monotonic_ns()?)?;
+            fences.with_open(binding.id, || {
+                registry.redeem_grant(nonce, &action, uid, evidence::monotonic_ns()?)
+            })?;
             Ok(json!({}))
         }
         Request::BrokerDenial { reason } => {
@@ -297,7 +303,9 @@ fn broker_request(
         Request::BrokerCheck { nonce } => {
             let session = broker::controller_session(collector)?;
             registry.authenticate_controller_session(nonce, session)?;
-            registry.check_dispatch(nonce, uid, evidence::monotonic_ns()?)?;
+            fences.with_open(binding.id, || {
+                registry.check_dispatch(nonce, uid, evidence::monotonic_ns()?)
+            })?;
             Ok(json!({}))
         }
         Request::BrokerFinish { nonce, outcome } => {
@@ -308,12 +316,21 @@ fn broker_request(
     }
 }
 
-fn attach_gateway(registry: &mut Registry, config: &Config, item: &Workload) -> GuardResult<()> {
+fn attach_gateway(
+    registry: &mut Registry,
+    config: &Config,
+    item: &Workload,
+    fences: &Fences,
+) -> GuardResult<()> {
+    if let Err(error) = fences.with_open(item.enrollment.id, || Ok(())) {
+        let _ = Lifecycle::new(registry, &Libvirt).contain(item.enrollment.id, true);
+        return Err(error);
+    }
     if !item.enrollment.broker {
         return Ok(());
     }
     let collector = config.collector.as_ref().ok_or("gateway disabled")?;
-    match broker::start(registry, item, collector, &config.socket) {
+    match broker::start(registry, item, collector, &config.socket, fences) {
         Ok(mut child) => {
             if let Err(error) = registry.bind_gateway_process(item, child.id()) {
                 let _ = child.kill();
@@ -351,9 +368,15 @@ fn attach_gateway(registry: &mut Registry, config: &Config, item: &Workload) -> 
     }
 }
 
-fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> GuardResult<Value> {
+fn handle(
+    req: Request,
+    registry: &mut Registry,
+    config: &Config,
+    uid: u32,
+    fences: &Fences,
+) -> GuardResult<Value> {
     if uid != 0 {
-        return broker_request(req, registry, config, uid);
+        return broker_request(req, registry, config, uid, fences);
     }
     let vm = Libvirt;
     let mut lifecycle = Lifecycle::new(registry, &vm);
@@ -385,14 +408,17 @@ fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> G
                 input,
                 broker,
             })?;
+            fences.register(row.enrollment.id)?;
             (
                 json!(row),
                 Some((row.enrollment.id, "WORKLOAD_ENROLLED", "VERIFIED")),
             )
         }
         Request::Start { id } => {
+            lifecycle.status(id)?.ok_or("unmanaged workload")?;
+            fences.with_open(id, || Ok(()))?;
             let row = lifecycle.start(id, |row| config.overlay(row))?;
-            attach_gateway(registry, config, &row)?;
+            attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_STARTED", "VERIFIED")))
         }
         Request::Status { id } => (
@@ -418,14 +444,19 @@ fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> G
             (json!(row), Some((id, "WORKLOAD_PAUSED", "VERIFIED")))
         }
         Request::Resume { id } => {
-            config.validate_enrolled(&lifecycle.status(id)?.ok_or("unmanaged workload")?)?;
+            let row = lifecycle.status(id)?.ok_or("unmanaged workload")?;
+            fences.with_open(id, || Ok(()))?;
+            config.validate_enrolled(&row)?;
             let row = lifecycle.resume(id)?;
-            attach_gateway(registry, config, &row)?;
+            attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_RESUMED", "VERIFIED")))
         }
         Request::Contain { id } | Request::Terminate { id } => {
             let terminate = matches!(req, Request::Terminate { .. });
+            lifecycle.status(id)?.ok_or("unmanaged workload")?;
+            let latched = fences.cutoff(id, |_| Ok(()));
             let report = lifecycle.contain(id, terminate)?;
+            latched?;
             let mode = if terminate {
                 report.shutdown
             } else {
@@ -453,7 +484,7 @@ fn handle(req: Request, registry: &mut Registry, config: &Config, uid: u32) -> G
         Request::Release { id } => {
             config.validate_enrolled(&lifecycle.status(id)?.ok_or("unmanaged workload")?)?;
             (
-                json!(lifecycle.release(id)?),
+                json!(fences.release(id, |latched| lifecycle.release_latched(id, latched))?),
                 Some((id, "WORKLOAD_RELEASED", "VERIFIED")),
             )
         }
@@ -536,6 +567,21 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
     Ok(config)
 }
 
+fn bind_socket(path: &Path) -> GuardResult<UnixListener> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err("another process owns the configured socket".into());
+            }
+            fs::remove_file(path)?;
+        }
+        Ok(_) => return Err("refusing to replace an unexpected socket path".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(UnixListener::bind(path)?)
+}
+
 fn serve(config: Config) -> GuardResult<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Err("guardd must run as host root".into());
@@ -580,18 +626,22 @@ fn serve(config: Config) -> GuardResult<()> {
     registry.recover_effects()?;
     Lifecycle::new(&mut registry, &Libvirt).reconcile()?;
 
-    match fs::symlink_metadata(&config.socket) {
-        Ok(meta) if meta.file_type().is_socket() && meta.uid() == 0 => {
-            if std::os::unix::net::UnixStream::connect(&config.socket).is_ok() {
-                return Err("another process owns the configured socket".into());
-            }
-            fs::remove_file(&config.socket)?;
-        }
-        Ok(_) => return Err("refusing to replace an unexpected socket path".into()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let fence_path = state.join("emergency");
+    match fs::create_dir(&fence_path) {
+        Ok(()) => fs::File::open(&state)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error.into()),
     }
-    let listener = UnixListener::bind(&config.socket)?;
+    secure_directory(&fence_path)?;
+    let fences = Arc::new(Fences::new(fence_path));
+    // Startup closes every previous broker binding before serving either socket.
+    for row in registry.all()? {
+        fences.register(row.enrollment.id)?;
+    }
+    let cutoff_path = emergency::socket_path(&config.socket)?;
+    let cutoff_listener = bind_socket(&cutoff_path)?;
+    fs::set_permissions(&cutoff_path, fs::Permissions::from_mode(0o600))?;
+    let listener = bind_socket(&config.socket)?;
     let mode = if config.collector.is_some() {
         let path = std::ffi::CString::new(config.socket.as_os_str().as_encoded_bytes())?;
         if unsafe { libc::chown(path.as_ptr(), 0, BROKER_GROUP) } != 0 {
@@ -602,6 +652,8 @@ fn serve(config: Config) -> GuardResult<()> {
         0o600
     };
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(mode))?;
+    let cutoff_fences = Arc::clone(&fences);
+    thread::spawn(move || emergency::serve(cutoff_listener, &cutoff_fences));
     for stream in listener.incoming() {
         let mut stream = stream?;
         let request = configure(&stream).and_then(|_| {
@@ -611,7 +663,7 @@ fn serve(config: Config) -> GuardResult<()> {
                 registry.require_gateway_process(binding, peer)?;
             }
             let request = read_frame(&stream)?;
-            handle(request, &mut registry, &config, peer.uid)
+            handle(request, &mut registry, &config, peer.uid, &fences)
         });
         let envelope = match request {
             Ok(result) => json!({"ok": true, "result": result}),

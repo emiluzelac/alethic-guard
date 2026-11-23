@@ -387,20 +387,58 @@ impl Sandbox {
     }
 
     pub fn seal(self) -> GuardResult<()> {
+        let link = self.lower_link();
         let filter = self.install(&[], 0);
+        filter?;
+        link
+    }
+
+    fn lower_link(self) -> GuardResult<()> {
         let link = self.host_link();
-        if self.link_present()? {
-            invoke(IP, &["link", "set", &link, "down"], None)?;
-            let observed: Value =
-                serde_json::from_str(&invoke(IP, &["-j", "link", "show", "dev", &link], None)?)?;
-            let flags = observed[0]["flags"]
-                .as_array()
-                .ok_or("cannot verify gateway link state")?;
-            if flags.iter().any(|flag| flag == "UP") {
-                return Err("gateway host link is still up".into());
-            }
+        if !self.link_present()? {
+            return self.verify_link_absent();
         }
-        filter
+        let lower = invoke(IP, &["link", "set", &link, "down"], None);
+        let links: Value = serde_json::from_str(&invoke(IP, &["-j", "link", "show"], None)?)?;
+        if !self.observed_link_present(&links)? {
+            // Routine containment may have removed the link during cutoff.
+            return self.verify_link_absent();
+        }
+        lower?;
+        let row = links
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["ifname"] == link))
+            .ok_or("cannot verify gateway link state")?;
+        let flags = row["flags"]
+            .as_array()
+            .filter(|flags| flags.iter().all(Value::is_string))
+            .ok_or("cannot verify gateway link flags")?;
+        if flags.iter().any(|flag| flag == "UP") {
+            return Err("gateway host link is still up".into());
+        }
+        Ok(())
+    }
+
+    fn verify_link_absent(self) -> GuardResult<()> {
+        let ns = self.namespace();
+        let namespace = std::path::Path::new("/run/netns").join(&ns);
+        if !namespace.try_exists()? {
+            return Ok(());
+        }
+        let output = invoke(IP, &["-n", &ns, "-j", "link", "show"], None);
+        if !namespace.try_exists()? {
+            return Ok(());
+        }
+        let links: Value = serde_json::from_str(&output?)?;
+        let links = links
+            .as_array()
+            .ok_or("invalid gateway namespace link observation")?;
+        if links.iter().any(|row| row["ifname"] != "lo") {
+            return Err(
+                "gateway namespace has a link while its expected host link is absent".into(),
+            );
+        }
+        Ok(())
     }
 }
 

@@ -4,6 +4,7 @@ use crate::{
     auth::peer_uid,
     collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest},
     effect::{Action, Governance},
+    emergency::Fences,
     evidence,
     lifecycle::{Mode, Registry, Workload},
     network::Sandbox,
@@ -194,6 +195,7 @@ pub fn prepare(
     config: &CollectorConfig,
     peer: u32,
     request: GuestRequest,
+    fences: &Fences,
 ) -> GuardResult<Prepared> {
     let binding = registry.gateway_by_uid(peer)?;
     let row = registry.get(binding.id)?.ok_or("unenrolled gateway")?;
@@ -227,7 +229,9 @@ pub fn prepare(
         }),
     )?;
     let now = evidence::monotonic_ns()?;
-    let nonce = registry.issue_grant(&action, &decision, peer, now)?;
+    let nonce = fences.with_open(binding.id, || {
+        registry.issue_grant(&action, &decision, peer, now)
+    })?;
     Ok(Prepared {
         action,
         nonce,
@@ -240,12 +244,15 @@ pub fn start(
     row: &Workload,
     config: &CollectorConfig,
     socket: &Path,
+    fences: &Fences,
 ) -> GuardResult<Child> {
     let collector = Collector::parse_url(&config.target)?;
     collector.resolve(&config.addresses)?;
     controller_session(config)?;
     let binding = registry.reserve_gateway(row)?;
     let sandbox = binding.sandbox()?;
+    // Publish the link identity before creating any network objects.
+    fences.bind(binding.id, sandbox)?;
     sandbox.create()?;
     let xml = Libvirt.active_xml(row.enrollment.id)?;
     let path = broker_socket(&xml, &row.domain()?)?;
@@ -281,7 +288,9 @@ pub fn start(
             Ok(())
         });
     }
-    sandbox.enable(&config.addresses, collector.port)?;
+    fences.enable(binding.id, || {
+        sandbox.enable(&config.addresses, collector.port)
+    })?;
     let mut child = process.spawn()?;
     if let Err(error) = registry.set_gateway(binding, true, false) {
         let _ = child.kill();

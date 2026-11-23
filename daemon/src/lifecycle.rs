@@ -178,7 +178,7 @@ impl Registry {
         Ok(())
     }
 
-    fn all(&self) -> GuardResult<Vec<Workload>> {
+    pub fn all(&self) -> GuardResult<Vec<Workload>> {
         let mut query = self.conn.prepare("SELECT record FROM workloads")?;
         let raw = query.query_map([], |row| row.get::<_, String>(0))?;
         raw.map(|record| Ok(serde_json::from_str(&record?)?))
@@ -410,8 +410,14 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     }
 
     pub fn release(&mut self, id: Uuid) -> GuardResult<Workload> {
+        self.release_latched(id, false)
+    }
+
+    pub fn release_latched(&mut self, id: Uuid, latched: bool) -> GuardResult<Workload> {
         let mut item = self.known(id)?;
-        if !matches!(item.mode, Mode::Contained | Mode::Terminated) || !self.vm.verify_absent(id)? {
+        let releasable = matches!(item.mode, Mode::Contained | Mode::Terminated)
+            || (latched && item.mode == Mode::Ready);
+        if !releasable || !self.vm.verify_absent(id)? {
             return Err("release requires a contained workload with verified shutdown".into());
         }
         item.mode = Mode::Ready;
