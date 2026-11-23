@@ -2,11 +2,11 @@
 
 Use the Ubuntu 24.04 x86-64 host and KVM configuration described in the [runtime matrix](GUARANTEE_MATRIX.md). Install the distribution packages for libvirt, virsh, QEMU, qemu-img, POSIX ACL tools, and `python3-venv`. The mediated lab additionally requires iproute2, nftables, and a dedicated collector route.
 
-Use the archive and `SHA256SUMS` in the [public release downloads](https://github.com/emiluzelac/alethic-guard/tree/release-assets/v0.2.0). Verify the archive checksum before unpacking. The archive contains the two host binaries, the systemd unit, the policy examples, and `alethic_guard-0.2.0-py3-none-any.whl`. Run the following from the unpacked directory.
+Use the archive and `SHA256SUMS` in the [public release downloads](https://github.com/emiluzelac/alethic-guard/tree/release-assets/v0.3.0). Verify the archive checksum before unpacking. The archive contains the two host binaries, the systemd unit, the policy examples, and `alethic_guard-0.3.0-py3-none-any.whl`. Run the following from the unpacked directory.
 
 ```sh
 sudo python3 -m venv /opt/alethic-guard/venv
-sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt ./python/alethic_guard-0.2.0-py3-none-any.whl
+sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt ./python/alethic_guard-0.3.0-py3-none-any.whl
 sudo install -m 0755 bin/alethic-guardd /usr/local/sbin/alethic-guardd
 sudo install -m 0755 bin/alethic-guard-gateway /usr/local/bin/alethic-guard-gateway
 ```
@@ -53,7 +53,7 @@ Install Guard with its `controller` extra to use the pinned Alethic kernel wheel
 If you supply `ca_file`, install the public CA certificate as root-owned mode `0444` in the policy directory. The unprivileged gateway must be able to traverse its parent directory and read the certificate. Keep the collector's private key on the collector.
 
 ```sh
-sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt './python/alethic_guard-0.2.0-py3-none-any.whl[controller]'
+sudo /opt/alethic-guard/venv/bin/python -m pip install -c ./python/constraints.txt './python/alethic_guard-0.3.0-py3-none-any.whl[controller]'
 /opt/alethic-guard/venv/bin/alethic-guard profile compile policy/examples/allowlisted-api.yaml --mediated-api --output ./broker-lab.json
 sudo install -m 0444 ./broker-lab.json /etc/alethic-guard/policies/
 sudo install -d -m 0700 -o alethic-guard-controller -g alethic-guard-controller /var/lib/alethic-guard/controller
@@ -98,3 +98,7 @@ Run the receiver under a dedicated account that can read its TLS key and token f
 From the enrolled guest, run `python3 collector.py --fixture release-evidence` with the bundled `guest/tool-client/collector.py`. Keep the reader credential on the operator side.
 
 Use the reader credential over verified TLS to retrieve `GET /v1/release-evidence/<idempotency-key>`. The response contains the key and payload SHA-256. Repeated writes of the same canonical bytes with the same key return the original receipt. Reusing a key with a different record returns HTTP 409. After an ambiguous delivery, read the receipt independently and use the root operator’s `reconcile_receipt` command with the original workload and request IDs. Persist the SQLite file and its sidecars across collector restarts.
+
+## Emergency VM shutdown
+
+Use `sudo alethic-guard workload emergency-terminate WORKLOAD_ID` when the ordinary operator queue is busy and the managed VM needs to stop. Check `shutdown` separately from `broker_cutoff`. Follow the [revocation and recovery procedure](REVOCATION.md) to reconcile the normal journal and release the fence.

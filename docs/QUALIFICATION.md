@@ -1,5 +1,13 @@
 # Alethic Guard release qualification
 
+## Version 0.3.0
+
+The local-agent lab uses physical Intel KVM with Ubuntu 24.04.5 x86-64, Linux `7.0.0-42-generic`, libvirt `10.0.0-2ubuntu8.19`, and QEMU `1:8.2.2+ds-0ubuntu1.18`. The test runs in disposable Ubuntu userspace with private networking and an AppArmor override for container namespace mounts. The enrolled guest uses one CPU and 1 GiB of RAM.
+
+The release candidate at `f47726f1782403f95a2205296abd50fae67cc445` ran the pinned SmolLM2 model against a synthetic maintenance note. The calibrated lab listener saw zero guest connection attempts. The host authorized one release evidence record and the collector returned its matching receipt. The emergency stop reported verified shutdown while an enrollment and a separate status request were still pending. A separate process confirmed the domain and its QEMU process were absent. Pausing the libvirt observer produced `UNKNOWN` for shutdown and the restart probe confirmed the fence before ordinary cleanup.
+
+The [release download and evidence directory](https://github.com/emiluzelac/alethic-guard/tree/release-assets/v0.3.0) contains the archive checksums, the replay record for the released bits, a checkpoint retained off the KVM host, and a verifier for the raw observations. See the [local-agent procedure](../tests/lab/local-agent/README.md).
+
 ## Version 0.2.0
 
 The release evidence collector and broker were live-qualified on Ubuntu 24.04.5 x86-64, Linux `7.0.0-42-generic`, and physical Intel KVM. libvirt `10.0.0-2ubuntu8.19` and QEMU `1:8.2.2+ds-0ubuntu1.18` ran inside disposable Ubuntu userspace using the physical host kernel. The lab used private networking, an AppArmor override for namespace mounts, and outer container resource limits. The released 0.1.0 binaries also passed the NIC-free offline guest probe in that environment.

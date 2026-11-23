@@ -20,7 +20,7 @@ Production security claims require independently reproduced evidence and an inde
 
 The validated host and runtime versions bound the qualification. The emergency socket reports broker admission and network cutoff. Its emergency termination command additionally reports an independent VM shutdown observation. The normal operator socket records containment and termination in the journal.
 
-## Planned local agent qualification for v0.3.0
+## Local agent qualification for v0.3.0
 
 Run a pinned open-weight CPU model inside an enrolled VM. Record the model and guest image digests, the VM resources, and the policy digest. Have the model complete a normal task with a synthetic document through the restricted guest tool interface.
 
