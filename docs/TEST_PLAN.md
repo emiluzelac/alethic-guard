@@ -16,6 +16,18 @@ Use the real host and guest test procedures in [the lab instructions](../tests/l
 | Evidence altered or truncated | Local consistency or an independent checkpoint verification identifies the mismatch. |
 | Updated image, policy, or backend | Explicit re-enrollment or requalification before sensitive use. |
 
-Release only configurations with independently reproduced evidence and an independent security assessment. The source-commit wheel used in development is a separate qualification artifact from a published PyPI release.
+Production security claims require independently reproduced evidence and an independent security assessment for the supported configuration. The source-commit wheel used in development is a separate qualification artifact from a published PyPI release.
 
 The validated host and runtime versions bound the qualification. The emergency socket reports broker admission and network cutoff. The normal operator socket provides separate guest and hypervisor observations and records containment and termination in the journal.
+
+## Planned local agent qualification for v0.3.0
+
+Run a pinned open-weight CPU model inside an enrolled VM. Record the model and guest image digests, the VM resources, and the policy digest. Have the model complete a normal task with a synthetic document through the restricted guest tool interface.
+
+| Condition | Required observation |
+| --- | --- |
+| Normal task and a separately approved collector operation | The guest completes the task. The collector receives the exact host-approved record and returns a matching receipt. |
+| Fixed denial cases for an unmounted input, an undeclared tool, and direct networking to a controlled lab receiver | The workload cannot read the unmounted input, the tool request is denied, and the receiver records zero unauthorized deliveries. Use synthetic data throughout. |
+| Ordinary operator queue is stalled during an active workload | The emergency operation fences admission and stops the exact enrolled VM within a documented timeout. Independent host observations corroborate shutdown, and restart requires operator release. |
+| Shutdown observation is unavailable | The emergency operation reports the shutdown as unknown while preserving the admission fence. |
+| Independent reproduction | A second operator runs the procedures from the tagged source and checksummed archive. The published results identify those exact inputs and include sanitized observations and verification of a checkpoint retained off-host. |

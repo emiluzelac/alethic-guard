@@ -13,8 +13,9 @@ The release evidence collector and broker were live-qualified on Ubuntu 24.04.5 
 
 The staging test retained the SQLite filesystem across process restarts. See the [guarantee matrix](GUARANTEE_MATRIX.md) and [deployment guide](DEPLOY_LINUX.md) for the applicable scope.
 
-## Version 0.1.0
+The live collector run used implementation commit `03a5ad2e12981cb59845f79d246b757d421a1e96`. The v0.2.0 tag, `79fada9ff0c4fdd6dfceb53650de95d2c796a34f`, passed Forgejo CI for Python 3.11, Python 3.12, and Rust and a separate check against the published kernel wheel. The release archive passed a clean Ubuntu installation check. Its checksum is in the [public SHA256SUMS file](https://github.com/emiluzelac/alethic-guard/blob/release-assets/v0.2.0/SHA256SUMS). [Tagged source](https://github.com/emiluzelac/alethic-guard/tree/v0.2.0)
 
+## Version 0.1.0
 
 The qualification used an isolated Ubuntu 24.04.5 x86-64 host with nested KVM and synthetic inputs. The live controller used the published `alethic-kernel==0.4.0` wheel. The [guarantee matrix](GUARANTEE_MATRIX.md) identifies the tested packages, firmware and guest image.
 
