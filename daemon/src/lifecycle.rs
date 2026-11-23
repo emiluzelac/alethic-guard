@@ -505,6 +505,14 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     }
 
     pub fn resume(&mut self, id: Uuid) -> GuardResult<Workload> {
+        self.resume_guarded(id, |_| Ok(()))
+    }
+
+    pub fn resume_guarded(
+        &mut self,
+        id: Uuid,
+        validate_artifacts: impl FnOnce(&Workload) -> GuardResult<()>,
+    ) -> GuardResult<Workload> {
         let mut item = self.known(id)?;
         if item.mode != Mode::Paused {
             return Err("resume requires a verified paused workload".into());
@@ -512,6 +520,10 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         if self.vm.state(id).ok() != Some(VmState::Paused) || self.verify_active(&item).is_err() {
             self.contain(id, true)?;
             return Err("unable to verify the paused domain".into());
+        }
+        if let Err(error) = validate_artifacts(&item) {
+            self.contain(id, true)?;
+            return Err(error);
         }
         item.mode = Mode::Starting;
         self.registry.save(&item)?;

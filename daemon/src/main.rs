@@ -453,10 +453,9 @@ fn handle(
             (json!(row), Some((id, "WORKLOAD_PAUSED", "VERIFIED")))
         }
         Request::Resume { id } => {
-            let row = lifecycle.status(id)?.ok_or("unmanaged workload")?;
+            lifecycle.status(id)?.ok_or("unmanaged workload")?;
             fences.with_open(id, || Ok(()))?;
-            config.validate_enrolled(&row)?;
-            let row = lifecycle.resume(id)?;
+            let row = lifecycle.resume_guarded(id, |row| config.validate_enrolled(row))?;
             attach_gateway(registry, config, &row, fences)?;
             (json!(row), Some((id, "WORKLOAD_RESUMED", "VERIFIED")))
         }
@@ -662,13 +661,7 @@ fn fence_directory(state: &Path) -> GuardResult<PathBuf> {
     Ok(path)
 }
 
-fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
-    require_root()?;
-    let state = data.join("state");
-    secure_directory(&state)?;
-    let _lock = acquire_daemon_lock(&state)?;
-    let database = state.join("guard.sqlite3");
-    let metadata = fs::symlink_metadata(&database)?;
+fn secure_database(metadata: &fs::Metadata) -> GuardResult<()> {
     if !metadata.is_file()
         || metadata.uid() != 0
         || metadata.mode() & 0o077 != 0
@@ -676,6 +669,16 @@ fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
     {
         return Err("expected a private root-owned enrollment database".into());
     }
+    Ok(())
+}
+
+fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
+    require_root()?;
+    let state = data.join("state");
+    secure_directory(&state)?;
+    let _lock = acquire_daemon_lock(&state)?;
+    let database = state.join("guard.sqlite3");
+    secure_database(&fs::symlink_metadata(&database)?)?;
     let mut registry = Registry::open_for_recovery(&database)?;
     let report = registry.recover_host(
         id,
@@ -691,11 +694,36 @@ fn recover(id: Uuid, data: &Path) -> GuardResult<()> {
 
 fn serve(mut config: Config, collector_path: Option<(&Path, bool)>) -> GuardResult<()> {
     require_root()?;
+    let state = config.data.join("state");
+    secure_directory(&state)?;
+    let _lock = acquire_daemon_lock(&state)?;
+    let database = state.join("guard.sqlite3");
+    match fs::symlink_metadata(&database) {
+        Ok(metadata) => {
+            secure_database(&metadata)?;
+            let existing = Registry::open_for_recovery(&database)?;
+            // Stop VMs left by an earlier daemon before validating anything
+            // that only affects future launches or loading the collector.
+            for enrollment in existing.all()? {
+                let id = enrollment.enrollment.id;
+                if let Err(error) = Libvirt::emergency_shutdown(id) {
+                    eprintln!("startup VM shutdown for {id}: {error}");
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut registry = Registry::open(&database)?;
+    let cutoff = broker::stop(&mut registry, None);
+    let reconciliation = Lifecycle::new(&mut registry, &Libvirt).reconcile();
+    cutoff?;
+    reconciliation?;
+    registry.recover_effects()?;
+
     for directory in [
-        &config.data,
         &config.policies,
         &config.data.join("run"),
-        &config.data.join("state"),
         &config
             .socket
             .parent()
@@ -707,8 +735,7 @@ fn serve(mut config: Config, collector_path: Option<(&Path, bool)>) -> GuardResu
         }
         secure_directory(directory)?;
     }
-    let state = config.data.join("state");
-    let _lock = acquire_daemon_lock(&state)?;
+    config.emulator_uid = emulator_uid()?;
     let artifacts = config.data.join("run/artifacts");
     match fs::create_dir(&artifacts) {
         Ok(()) => {}
@@ -717,20 +744,6 @@ fn serve(mut config: Config, collector_path: Option<(&Path, bool)>) -> GuardResu
     }
     secure_directory(&artifacts)?;
     alethic_guardd::artifact::restrict_to_emulator(&artifacts, config.emulator_uid)?;
-    let mut registry = Registry::open(&state.join("guard.sqlite3"))?;
-    // A failed platform dependency must not delay attempts to stop VMs left
-    // running by an earlier daemon. The registry remains exclusively locked.
-    for enrollment in registry.all()? {
-        let id = enrollment.enrollment.id;
-        if let Err(error) = Libvirt::emergency_shutdown(id) {
-            eprintln!("startup VM shutdown for {id}: {error}");
-        }
-    }
-    let cutoff = broker::stop(&mut registry, None);
-    let reconciliation = Lifecycle::new(&mut registry, &Libvirt).reconcile();
-    cutoff?;
-    reconciliation?;
-    registry.recover_effects()?;
     if let Some((path, optional)) = collector_path {
         config.collector = match fs::symlink_metadata(path) {
             Ok(_) => Some(load_collector(path)?),
@@ -822,7 +835,6 @@ fn run() -> GuardResult<()> {
         [_, _, _, collector] => Some((Path::new(collector), false)),
         _ => None,
     };
-    let emulator_uid = emulator_uid()?;
     let config =
         match if installed { &[] } else { args.as_slice() } {
             [] => Config {
@@ -830,14 +842,14 @@ fn run() -> GuardResult<()> {
                 policies: "/etc/alethic-guard/policies".into(),
                 socket: "/run/alethic-guard/operator.sock".into(),
                 collector: None,
-                emulator_uid,
+                emulator_uid: 0,
             },
             [data, policies, socket, ..] if args.len() <= 4 => Config {
                 data: data.into(),
                 policies: policies.into(),
                 socket: socket.into(),
                 collector: None,
-                emulator_uid,
+                emulator_uid: 0,
             },
             _ => return Err(
                 "usage: alethic-guardd [--installed | DATA_DIR POLICY_DIR OPERATOR_SOCKET [COLLECTOR_CONFIG]]"

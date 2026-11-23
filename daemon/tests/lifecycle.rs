@@ -165,6 +165,25 @@ fn resume_contains_a_vm_that_disagrees_with_its_recorded_pause() {
 }
 
 #[test]
+fn failed_resume_artifact_validation_contains_the_paused_vm() {
+    let mut registry = Registry::memory().unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let vm = FakeVm::default();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(id, launch).unwrap();
+    lifecycle.pause(id).unwrap();
+    assert!(
+        lifecycle
+            .resume_guarded(id, |_| Err("approved image changed".into()))
+            .is_err()
+    );
+    assert!(vm.verify_absent(id).unwrap());
+    assert_eq!(registry.get(id).unwrap().unwrap().mode, Mode::Terminated);
+}
+
+#[test]
 fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
     let mut registry = Registry::memory().unwrap();
     let enrollment = enrolled();
