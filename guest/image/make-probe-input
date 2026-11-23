@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+    printf '%s\n' "usage: make-probe-input SCRATCH_DIR OUTPUT_IMAGE [offline|broker]" >&2
+    exit 2
+fi
+scratch=$1
+output=$2
+mode=${3:-offline}
+case "$mode" in offline|broker) ;; *) exit 2 ;; esac
+mkdir -p "$scratch"
+test ! -e "$output"
+{
+    printf '%s\n' '#cloud-config' 'write_files:' '  - path: /usr/local/lib/guard-probe.py' '    owner: root:root' '    permissions: "0644"' '    encoding: b64'
+    printf '    content: %s\n' "$(base64 -w0 "$root/${mode}_probe.py")"
+    printf '%s\n' 'runcmd:' '  - [sh, -c, "timeout 25 python3 /usr/local/lib/guard-probe.py > /dev/ttyS0 2>&1"]'
+} > "$scratch/user-data"
+printf '%s\n' 'instance-id: alethic-guard-offline-probe' 'local-hostname: guard-offline' > "$scratch/meta-data"
+cloud-localds "$output" "$scratch/user-data" "$scratch/meta-data"

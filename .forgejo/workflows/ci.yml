@@ -11,7 +11,38 @@ jobs:
         python: ['3.11', '3.12']
     container: python:${{ matrix.python }}-bookworm
     steps:
-      - uses: actions/checkout@v4
-      - run: python -m pip install '.[test]'
-      - run: python -m pytest
-      - run: alethic-guard profile validate policy/examples/offline-research.yaml
+      - name: Check out verified commit
+        env:
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: token $TOKEN" \
+            git fetch -q --depth 1 "$SERVER/$REPOSITORY.git" "$COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+      - run: python -m pip install uv==0.12.9
+      - run: scripts/build-kernel-wheel
+      - run: uv run --locked --python ${{ matrix.python }} --extra test --with .wheels/alethic_kernel-0.4.0-py3-none-any.whl python -m pytest
+      - run: uv run --locked alethic-guard profile validate policy/examples/offline-research.yaml
+
+  rust:
+    runs-on: [self-hosted, linux, x64, iam-ci-isolated]
+    container: rust:1.85-bookworm
+    steps:
+      - name: Check out verified commit
+        env:
+          SERVER: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          TOKEN: ${{ github.token }}
+        run: |
+          git init -q .
+          GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader GIT_CONFIG_VALUE_0="Authorization: token $TOKEN" \
+            git fetch -q --depth 1 "$SERVER/$REPOSITORY.git" "$COMMIT"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$COMMIT"
+      - run: cargo test --manifest-path daemon/Cargo.toml --locked
+      - run: cargo test --manifest-path gateway/Cargo.toml --locked

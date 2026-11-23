@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+commit=a8fc86bf39f1286d9f7471ae4e8100b96bab3d30
+source_repo=https://github.com/emiluzelac/alethic.git
+wheel_dir=${1:-"$repo/.wheels"}
+mkdir -p "$wheel_dir"
+wheel_dir=$(cd "$wheel_dir" && pwd)
+source_dir=$(mktemp -d)
+trap 'rm -rf -- "$source_dir"' EXIT
+git -C "$source_dir" init -q
+git -C "$source_dir" fetch --depth=1 "$source_repo" "$commit"
+git -C "$source_dir" checkout --detach --quiet FETCH_HEAD
+test "$(git -C "$source_dir" rev-parse HEAD)" = "$commit"
+(
+    cd "$source_dir"
+    SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" PYTHONHASHSEED=0 uv build --python 3.12 \
+        --build-constraint "$repo/scripts/kernel-build-constraints.txt" --wheel --out-dir "$wheel_dir"
+)
+"$repo/scripts/verify-kernel-wheel" "$wheel_dir"

@@ -5,6 +5,7 @@ import hashlib
 from importlib.resources import files
 import json
 from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 import re
 
 from jsonschema import Draft202012Validator
@@ -31,6 +32,7 @@ class _PolicyLoader(yaml.SafeLoader):
 @dataclass(frozen=True)
 class BackendCapabilities:
     vm_isolated: bool = True
+    mediated_api: bool = False
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,26 @@ _SCHEMA = Draft202012Validator(
 )
 _GUEST_PATH = re.compile(r"/data(?:/[A-Za-z0-9_.-]+)+", re.ASCII)
 _MAX_POLICY_BYTES = 65_536
+_HOSTNAME = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+", re.ASCII)
+_TARGET_PATH = re.compile(r"/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+", re.ASCII)
+
+
+def _validate_destination(target: str) -> None:
+    if not target.isascii() or any(c.isspace() or ord(c) < 32 for c in target):
+        raise PolicyError("invalid collector destination")
+    parsed = urlsplit(target)
+    port = parsed.port
+    hostname = parsed.hostname or ""
+    if (
+        parsed.scheme != "https" or not _HOSTNAME.fullmatch(hostname)
+        or not hostname.rsplit(".", 1)[1].isalpha()
+        or parsed.netloc != hostname + (f":{port}" if port else "")
+        or port == 443 or not _TARGET_PATH.fullmatch(parsed.path)
+        or {".", ".."}.intersection(parsed.path.split("/"))
+        or target != f"https://{parsed.netloc}{parsed.path}"
+    ):
+        raise PolicyError("collector destination must be an exact canonical HTTPS URL")
+
 
 
 def compile_policy(document: bytes, capabilities: BackendCapabilities) -> CompiledPolicy:
@@ -65,10 +87,20 @@ def compile_policy(document: bytes, capabilities: BackendCapabilities) -> Compil
     spec = policy["spec"]
     if not capabilities.vm_isolated:
         raise PolicyError("backend does not support vm-isolated")
-    if spec["profile"] != "offline-strict":
-        raise PolicyError(f"unsupported profile: {spec['profile']}")
-    if spec["network"]["approved_broker_destinations"] or "collector.publish" in spec["tools"]["allowed"]:
-        raise PolicyError("offline-strict denies broker destinations and operations")
+    destinations = spec["network"]["approved_broker_destinations"]
+    collector = "collector.publish" in spec["tools"]["allowed"]
+    if spec["profile"] == "offline-strict":
+        if destinations or collector:
+            raise PolicyError("offline-strict denies broker destinations and operations")
+    elif spec["profile"] == "allowlisted-api" and capabilities.mediated_api:
+        if len(destinations) != 1 or not collector:
+            raise PolicyError("allowlisted-api requires one destination and collector.publish")
+        try:
+            _validate_destination(destinations[0])
+        except ValueError as error:
+            raise PolicyError("invalid collector destination") from error
+    else:
+        raise PolicyError(f"unsupported profile for this backend: {spec['profile']}")
     paths = []
     for volume in spec["filesystem"]["inputs"] + spec["filesystem"]["outputs"]:
         value = volume["path"]

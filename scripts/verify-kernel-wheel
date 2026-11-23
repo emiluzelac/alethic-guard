@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+if [ "$#" -ne 1 ]; then
+    printf '%s\n' "usage: verify-kernel-wheel WHEEL_DIRECTORY" >&2
+    exit 2
+fi
+cd "$1"
+sha256sum -c "$repo/scripts/kernel-wheel.sha256"

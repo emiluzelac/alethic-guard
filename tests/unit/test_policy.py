@@ -35,3 +35,17 @@ def test_policy_digest_is_stable_and_semantic():
     assert compiled.digest.startswith("sha256:")
     assert compile_policy(json.dumps(json.loads(compiled.canonical)).encode(), BackendCapabilities()) == compiled
     assert compile_policy(doc.replace(b"/data/results", b"/data/output"), BackendCapabilities()).digest != compiled.digest
+
+
+def test_mediated_profile_requires_capability_and_exact_https_endpoint():
+    path = EXAMPLE.with_name("allowlisted-api.yaml")
+    doc = path.read_bytes()
+    with pytest.raises(PolicyError, match="backend|unsupported"):
+        compile_policy(doc, BackendCapabilities())
+    caps = BackendCapabilities(mediated_api=True)
+    assert compile_policy(doc, caps).profile == "allowlisted-api"
+    for target in (b"http://collector.example/v1/fixture", b"https://user@collector.example/v1/fixture",
+                   b"https://collector.example/v1/fixture?source=guest",
+                   b"https://collector.example/a/../v1/fixture"):
+        with pytest.raises(PolicyError, match="destination"):
+            compile_policy(doc.replace(b"https://collector.example/v1/fixture", target), caps)

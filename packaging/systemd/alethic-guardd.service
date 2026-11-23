@@ -1,0 +1,19 @@
+[Unit]
+Description=Alethic Guard host enforcement
+After=libvirtd.service
+Requires=libvirtd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/alethic-guardd
+RuntimeDirectory=alethic-guard
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/alethic-guard /run/alethic-guard
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,8 @@
 /build/
 /dist/
 /target/
+/daemon/target/
+/gateway/target/
 *.egg-info/
 __pycache__/
 .pytest_cache/
