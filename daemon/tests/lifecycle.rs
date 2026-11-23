@@ -17,6 +17,7 @@ struct FakeVm {
     xml: RefCell<String>,
     drift: Cell<bool>,
     offline: Cell<bool>,
+    unavailable_workload: Cell<Option<Uuid>>,
     orphan: Cell<bool>,
     disappear_after_observation: Cell<bool>,
     persistent: Cell<bool>,
@@ -48,8 +49,8 @@ impl Hypervisor for FakeVm {
         }
         Ok(!self.persistent.get())
     }
-    fn state(&self, _: Uuid) -> GuardResult<VmState> {
-        if self.offline.get() {
+    fn state(&self, id: Uuid) -> GuardResult<VmState> {
+        if self.offline.get() || self.unavailable_workload.get() == Some(id) {
             Err("observer unavailable".into())
         } else {
             let state = self.state.get().unwrap_or(VmState::Absent);
@@ -108,6 +109,46 @@ fn test_unknown_domain_is_unmanaged() {
 }
 
 #[test]
+fn startup_attempts_later_workloads_after_one_observer_fails() {
+    let mut registry = Registry::memory().unwrap();
+    registry.enroll(&enrolled()).unwrap();
+    registry.enroll(&enrolled()).unwrap();
+    let rows = registry.all().unwrap();
+    let vm = FakeVm::default();
+    vm.unavailable_workload.set(Some(rows[0].enrollment.id));
+    vm.state.set(Some(VmState::Running));
+
+    assert!(Lifecycle::new(&mut registry, &vm).reconcile().is_err());
+    assert_eq!(vm.state(rows[1].enrollment.id).unwrap(), VmState::Absent);
+}
+
+#[test]
+fn failed_resume_record_stops_the_vm() {
+    let directory = tempdir().unwrap();
+    let database = directory.path().join("guard.sqlite3");
+    let mut registry = Registry::open(&database).unwrap();
+    let enrollment = enrolled();
+    let id = enrollment.id;
+    registry.enroll(&enrollment).unwrap();
+    let vm = FakeVm::default();
+    let mut lifecycle = Lifecycle::new(&mut registry, &vm);
+    lifecycle.start(id, launch).unwrap();
+    lifecycle.pause(id).unwrap();
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_running_mode BEFORE UPDATE ON workloads
+             WHEN json_extract(NEW.record, '$.mode') = 'RUNNING'
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;",
+        )
+        .unwrap();
+
+    assert!(lifecycle.resume(id).is_err());
+    assert!(vm.verify_absent(id).unwrap());
+    assert_eq!(registry.get(id).unwrap().unwrap().mode, Mode::Terminated);
+}
+
+#[test]
 fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
     let mut registry = Registry::memory().unwrap();
     let enrollment = enrolled();
@@ -133,7 +174,6 @@ fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
             |id| fences.cutoff(id, |_| Ok(())),
             |target| {
                 assert_eq!(target, id);
-                assert!(dir.path().join(id.to_string()).is_file());
                 Ok(true)
             },
         )
@@ -142,6 +182,7 @@ fn host_recovery_fences_only_the_enrolled_workload_and_requires_release() {
     assert_eq!(report.broker_cutoff, Observation::Verified);
     assert_eq!(report.shutdown, Observation::Verified);
     assert_eq!(report.record, Observation::Verified);
+    assert!(dir.path().join(id.to_string()).is_file());
 
     let row = registry.get(id).unwrap().unwrap();
     assert_eq!(row.mode, Mode::Terminated);

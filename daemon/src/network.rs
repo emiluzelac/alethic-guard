@@ -308,17 +308,33 @@ impl Sandbox {
         Ok(false)
     }
 
-    pub fn ensure_clean(self) -> GuardResult<()> {
-        let exists = invoke(IP, &["netns", "list"], None)?
+    fn namespace_present(self) -> GuardResult<bool> {
+        Ok(invoke(IP, &["netns", "list"], None)?
             .lines()
-            .any(|line| line.split_whitespace().next() == Some(self.namespace().as_str()));
+            .any(|line| line.split_whitespace().next() == Some(self.namespace().as_str())))
+    }
+
+    fn table_present(self) -> GuardResult<bool> {
         let tables: Value = serde_json::from_str(&invoke(NFT, &["-j", "list", "tables"], None)?)?;
-        let configured = tables["nftables"]
+        Ok(tables["nftables"]
             .as_array()
             .ok_or("invalid nft table list")?
             .iter()
-            .any(|row| row["table"]["family"] == "inet" && row["table"]["name"] == self.table());
-        if exists || configured || self.link_present()? {
+            .any(|row| row["table"]["family"] == "inet" && row["table"]["name"] == self.table()))
+    }
+
+    pub fn reclaim_retired(self) -> GuardResult<()> {
+        if self.namespace_present()? || self.link_present()? {
+            return Err("retired gateway still has a host link or namespace".into());
+        }
+        if self.table_present()? {
+            invoke(NFT, &["delete", "table", "inet", &self.table()], None)?;
+        }
+        Ok(())
+    }
+
+    pub fn ensure_clean(self) -> GuardResult<()> {
+        if self.namespace_present()? || self.table_present()? || self.link_present()? {
             return Err("gateway network slot is already in use".into());
         }
         Ok(())

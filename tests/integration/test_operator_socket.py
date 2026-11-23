@@ -38,7 +38,7 @@ def test_terminate_runs_cleanup_when_emergency_socket_is_unavailable(tmp_path, m
         calls.append((path.name, request["command"]))
         if path.name.endswith(".emergency"):
             raise ValueError("socket unavailable")
-        return {"shutdown": "VERIFIED"}
+        return {"shutdown": "VERIFIED", "broker_cutoff": "VERIFIED", "admissions": "VERIFIED"}
 
     monkeypatch.setattr(main, "daemon_call", daemon_call)
     assert main.main(["--socket", str(tmp_path / "operator.sock"), "workload", "terminate", WORKLOAD]) == 0
@@ -53,11 +53,11 @@ def test_emergency_terminate_uses_only_the_emergency_socket(tmp_path, monkeypatc
 
     def daemon_call(path, request, timeout):
         calls.append((path.name, request))
-        return {"broker_cutoff": "VERIFIED", "shutdown": "UNKNOWN"}
+        return {"admissions": "VERIFIED", "broker_cutoff": "VERIFIED", "shutdown": "UNKNOWN"}
 
     monkeypatch.setattr(main, "daemon_call", daemon_call)
     result = main.main(["--socket", str(tmp_path / "operator.sock"), "workload",
                         "emergency-terminate", WORKLOAD])
-    assert result == 0
+    assert result == 1
     assert calls == [("operator.sock.emergency", {"command": "terminate", "id": WORKLOAD})]
     assert json.loads(capsys.readouterr().out)["shutdown"] == "UNKNOWN"

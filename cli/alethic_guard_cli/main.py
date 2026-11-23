@@ -151,6 +151,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"alethic-guard: {error}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
+    if args.command == "workload" and args.verb in {
+        "cutoff", "contain", "terminate", "emergency-terminate",
+    }:
+        required = ["admissions", "broker_cutoff"]
+        if args.verb == "contain":
+            required.append("guest_network")
+        elif args.verb in {"terminate", "emergency-terminate"}:
+            required.append("shutdown")
+        return int(any(result.get(observation) != "VERIFIED" for observation in required))
     return 0
 
 

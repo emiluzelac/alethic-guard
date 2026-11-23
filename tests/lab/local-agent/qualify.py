@@ -8,17 +8,19 @@ from pathlib import Path
 import re
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 ROOT = Path("/var/lib/alethic-guard")
 SOCKET = Path("/run/alethic-guard/operator.sock")
-PYTHON = "/opt/alethic-guard/bin/python"
-CLI = "/opt/alethic-guard/bin/alethic-guard"
+PYTHON = "/opt/alethic-guard/current/venv/bin/python"
+CLI = "/opt/alethic-guard/current/venv/bin/alethic-guard"
+DAEMON = "/opt/alethic-guard/current/bin/alethic-guardd"
 FIT = ROOT / "images/noble-lab.qcow2"
-CONFIG = "/etc/alethic-guard/policies/release-collector.json"
 FIXTURE = {"profile": "broker-lab", "image": FIT.name, "input": "local-agent.img"}
 
 
@@ -95,6 +97,65 @@ def verify_receipt(effect):
         client.close()
 
 
+def namespaces():
+    listed = subprocess.check_output(["ip", "netns", "list"], text=True)
+    return {line.split()[0] for line in listed.splitlines() if line.strip()}
+
+
+def qualify_daemon_down(save, libvirt_pid):
+    before = namespaces()
+    enrollment = call(*ordinary("create", {**FIXTURE, "image": "minimal.qcow2"}))
+    id = enrollment["enrollment"]["id"]
+    call(*workload("start", id))
+    guests = qemu_pids(id)
+    assert len(guests) == 1, guests
+    created = namespaces() - before
+    assert len(created) == 1, created
+    namespace = created.pop()
+    assert re.fullmatch(r"aleg\d+", namespace)
+    link = namespace.replace("aleg", "agw")
+    subprocess.run(["ip", "link", "show", "dev", link], check=True, capture_output=True)
+    subprocess.run(["systemctl", "stop", "alethic-guardd.service", "alethic-guard-controller.service"],
+                   check=True)
+    assert not SOCKET.exists() and namespace in namespaces()
+    assert qemu_pids(id) == guests
+    command = [DAEMON, "--recover", id]
+    subprocess.run(["kill", "-STOP", str(libvirt_pid)], check=True)
+    try:
+        partial = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        assert partial.returncode == 1, partial
+        report = save("daemon-down-unavailable-hypervisor", json.loads(partial.stdout))
+        assert report["admissions"] == report["broker_cutoff"] == report["record"] == "VERIFIED"
+        assert report["shutdown"] == "UNKNOWN"
+        assert qemu_pids(id) == guests
+        assert namespace not in namespaces()
+        link_state = subprocess.run(["ip", "link", "show", "dev", link], capture_output=True)
+        assert link_state.returncode
+        table = namespace.replace("aleg", "alethic_guard_")
+        rules = subprocess.check_output(["nft", "list", "table", "inet", table], text=True)
+        assert sum(
+            line.strip().startswith(f'iifname "{link}" counter') and line.strip().endswith("drop")
+            for line in rules.splitlines()
+        ) == 2
+        assert all(" accept" not in line or "policy accept" in line for line in rules.splitlines())
+        save("daemon-down-network-observation", {
+            "namespace_absent": True, "host_link_absent": True, "deny_rules_present": True,
+        })
+    finally:
+        subprocess.run(["kill", "-CONT", str(libvirt_pid)], check=True)
+    report = save("daemon-down-retry", call(*command))
+    assert all(report[key] == "VERIFIED" for key in ("admissions", "broker_cutoff", "shutdown", "record"))
+    assert not qemu_pids(id)
+    assert id not in subprocess.check_output(["virsh", "list", "--all", "--uuid"], text=True).split()
+    subprocess.run(["systemctl", "start", "alethic-guardd.service"], check=True)
+    until(SOCKET.is_socket, "operator socket after offline recovery")
+    assert call(*workload("status", id))["mode"] == "TERMINATED"
+    blocked = subprocess.run(workload("start", id), capture_output=True, text=True, timeout=5)
+    assert blocked.returncode and "cutoff is latched" in blocked.stderr, blocked
+    assert call(*workload("release", id))["mode"] == "READY"
+    save("daemon-down-release-observation", {"explicit_operator_release_required": True})
+
+
 def main(output):
     output.mkdir()
     operator = ROOT / "controller"
@@ -111,17 +172,16 @@ def main(output):
             stack.callback(stop, process)
             return process
 
-        launch("controller", [
-            "setpriv", "--reuid", "guard-controller", "--regid", "guard-controller",
-            "--clear-groups", "--no-new-privs", PYTHON, "-I", "-m", "alethic_guard.api",
-            str(operator / "controller.sock"), str(operator / "kernel.sqlite3"),
-        ])
+        subprocess.run(["systemctl", "start", "alethic-guardd.service"], check=True)
+        stack.callback(subprocess.run, [
+            "systemctl", "stop", "alethic-guardd.service", "alethic-guard-controller.service",
+        ], check=True)
         until(lambda: (operator / "controller.sock").is_socket(), "governance controller")
-        daemon = launch("daemon", [
-            "/usr/local/sbin/alethic-guardd", str(ROOT),
-            "/etc/alethic-guard/policies", str(SOCKET), CONFIG,
-        ])
         until(SOCKET.is_socket, "Guard operator socket")
+        daemon = SimpleNamespace(pid=int(subprocess.check_output([
+            "systemctl", "show", "--property=MainPID", "--value", "alethic-guardd.service",
+        ], text=True)))
+        assert Path(f"/proc/{daemon.pid}/ns/mnt").readlink() == Path("/proc/1/ns/mnt").readlink()
 
         launch("collector", [
             "ip", "netns", "exec", "guard-release-collector", "setpriv",
@@ -178,13 +238,19 @@ def main(output):
         assert re.search(r"GUARD_AGENT inference .*\bDana\b", log)
         for marker in (
             "unmounted_input DENIED", "direct_network DENIED", "undeclared_tool DENIED",
-            "approved_delivery SUCCEEDED",
+            "shell_tool DENIED", "generic_http_tool DENIED", "unapproved_fixture DENIED",
+            "unapproved_destination DENIED", "unapproved_payload DENIED", "unapproved_identity DENIED",
+            "local_output WRITABLE", "serial_output HOST_VISIBLE", "approved_delivery SUCCEEDED",
         ):
             assert "GUARD_AGENT " + marker in log, marker
         request = re.search(r"GUARD_AGENT request_id ([0-9a-f-]+)", log)[1]
         effect = save("approved-effect", call(*ordinary("effect_status", {"id": id, "request": request})))
         assert effect["outcome"] == "SUCCEEDED"
         save("collector-receipt", verify_receipt(effect))
+        with sqlite3.connect(f"file:{stage / 'collector.sqlite3'}?mode=ro", uri=True) as collector_db:
+            receipts = collector_db.execute("SELECT COUNT(*) FROM receipts").fetchone()[0]
+        assert receipts == 1, receipts
+        save("boundary-observations", {"collector_receipts": receipts, "serial_host_visible": True})
 
         capture.send_signal(signal.SIGINT)
         assert capture.wait(timeout=5) == 0
@@ -237,7 +303,11 @@ def main(output):
         libvirt_pid = int(subprocess.check_output(["pgrep", "-x", "libvirtd"], text=True).strip())
         subprocess.run(["kill", "-STOP", str(libvirt_pid)], check=True)
         try:
-            unavailable = save("unavailable-observer", call(*workload("emergency-terminate", id)))
+            incomplete = subprocess.run(
+                workload("emergency-terminate", id), capture_output=True, text=True, timeout=10,
+            )
+            assert incomplete.returncode == 1, incomplete
+            unavailable = save("unavailable-observer", json.loads(incomplete.stdout))
             assert unavailable["admissions"] == unavailable["broker_cutoff"] == "VERIFIED"
             assert unavailable["shutdown"] == "UNKNOWN"
         finally:
@@ -255,8 +325,10 @@ def main(output):
         events = output / "events.jsonl"
         head = output / "head.json"
         save("export", call(CLI, "evidence", "export", id, "--output", str(events)))
+        assert b"GUARD_PRIVATE_OUTPUT_CANARY" not in events.read_bytes()
         save("verification", call(CLI, "evidence", "verify", str(events), "--write-checkpoint", str(head)))
         (output / "approved-record.json").write_bytes(Path("approved-record.json").read_bytes())
+        qualify_daemon_down(save, libvirt_pid)
     print("Local inference, scoped delivery, fixed denials, emergency shutdown, and evidence export passed.")
 
 

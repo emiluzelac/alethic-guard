@@ -43,7 +43,7 @@ libvirt domains are transient. The VM is checked in its paused state before the 
 
 ## Mediated setup
 
-Keep the guest NIC-free and provide a dedicated route from the Guard host to the collector. Enable IP forwarding for the collector address family. Reserve the UID range 300001–304094, GID 300000, names `aleg*`/`agw*`/`age*`, and subnet ranges `10.254.0.0/18` and `fd42:a1e7::/32` for Guard.
+Keep the guest NIC-free and provide a dedicated route from the Guard host to the collector. Enable IP forwarding for the collector address family. Reserve the UID range 300001–304094, GID 300000, names `aleg*`/`agw*`/`age*`, and subnet ranges `10.254.0.0/18` and `fd42:a1e7::/32` for Guard. The registry dedicates one slot to each mediated enrollment. Restarts and resumes reuse the same slot after verified cleanup.
 
 The installer creates the unprivileged `alethic-guard-controller` account and installs the pinned Alethic kernel wheel. Prepare `/etc/alethic-guard/collector.json` as a root-owned file with mode `0400`. Set the exact HTTPS `target`, approved global unicast `addresses`, `controller_socket` to `/var/lib/alethic-guard/controller/controller.sock`, and `controller_uid` to the numeric result of `id -u alethic-guard-controller`. Omit `gateway` to use the gateway packaged with the installed daemon. For an existing configuration, remove the old `gateway` field when upgrading to this installer. The collector's certificate must cover the configured hostname.
 
@@ -95,4 +95,4 @@ Use the reader credential over verified TLS to retrieve `GET /v1/release-evidenc
 
 ## Emergency VM shutdown
 
-Use `sudo alethic-guard workload emergency-terminate WORKLOAD_ID` when the ordinary operator queue is busy and the managed VM needs to stop. Check `shutdown` separately from `broker_cutoff`. Follow the [revocation and recovery procedure](REVOCATION.md) to reconcile the normal journal and release the fence.
+Use `sudo /opt/alethic-guard/current/venv/bin/alethic-guard workload emergency-terminate WORKLOAD_ID` when the ordinary operator queue is busy and the managed VM needs to stop. Check `shutdown` separately from `broker_cutoff`. Follow the [revocation and recovery procedure](REVOCATION.md) to reconcile the normal journal and release the fence.

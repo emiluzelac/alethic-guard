@@ -703,9 +703,11 @@ fn serve(config: Config) -> GuardResult<()> {
     secure_directory(&artifacts)?;
     alethic_guardd::artifact::restrict_to_emulator(&artifacts, config.emulator_uid)?;
     let mut registry = Registry::open(&state.join("guard.sqlite3"))?;
-    broker::stop(&mut registry, None)?;
+    let cutoff = broker::stop(&mut registry, None);
+    let reconciliation = Lifecycle::new(&mut registry, &Libvirt).reconcile();
+    cutoff?;
+    reconciliation?;
     registry.recover_effects()?;
-    Lifecycle::new(&mut registry, &Libvirt).reconcile()?;
 
     let fences = Arc::new(Fences::new(fence_directory(&state)?));
     // Startup closes every previous broker binding before serving either socket.

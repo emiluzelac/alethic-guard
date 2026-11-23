@@ -69,30 +69,66 @@ pub fn initialize(conn: &Connection) -> GuardResult<()> {
 
 impl Registry {
     pub fn reserve_gateway(&mut self, item: &Workload) -> GuardResult<Binding> {
-        let txn = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        txn.execute(
-            "INSERT INTO gateway_bindings (workload, generation) VALUES (?1, ?2)",
-            params![item.enrollment.id.to_string(), item.generation],
-        )?;
-        let slot = u16::try_from(txn.last_insert_rowid())?;
-        let binding = Binding {
-            id: item.enrollment.id,
-            generation: item.generation,
-            slot,
-            active: false,
-        };
-        binding.sandbox()?.ensure_clean()?;
-        if let Ok(users) = std::fs::read_to_string("/etc/passwd") {
+        self.reserve_gateway_with(item, |binding, reused| {
+            let users = std::fs::read_to_string("/etc/passwd")?;
             if users.lines().any(|line| {
                 line.split(':').nth(2).and_then(|id| id.parse::<u32>().ok()) == Some(binding.uid())
             }) {
                 return Err("reserved gateway UID is assigned to a host account".into());
             }
-        } else {
-            return Err("cannot verify reserved gateway UID".into());
-        }
+            let sandbox = binding.sandbox()?;
+            if reused {
+                sandbox.reclaim_retired()?;
+            }
+            sandbox.ensure_clean()
+        })
+    }
+
+    fn reserve_gateway_with(
+        &mut self,
+        item: &Workload,
+        prepare: impl FnOnce(Binding, bool) -> GuardResult<()>,
+    ) -> GuardResult<Binding> {
+        let txn = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = item.enrollment.id;
+        let previous: Option<(u16, bool)> = txn
+            .query_row(
+                "SELECT slot, retired FROM gateway_bindings WHERE workload=?1
+             ORDER BY retired, slot DESC LIMIT 1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let slot = match previous {
+            Some((slot, true)) => {
+                txn.execute(
+                    "UPDATE gateway_bindings SET generation=?1, active=0, retired=0 WHERE slot=?2",
+                    params![item.generation, slot],
+                )?;
+                txn.execute("DELETE FROM gateway_processes WHERE slot=?1", [slot])?;
+                slot
+            }
+            Some((_, false)) => {
+                return Err("existing gateway binding requires verified retirement".into());
+            }
+            None => {
+                txn.execute(
+                    "INSERT INTO gateway_bindings (workload, generation) VALUES (?1, ?2)",
+                    params![id.to_string(), item.generation],
+                )?;
+                u16::try_from(txn.last_insert_rowid())?
+            }
+        };
+        let binding = Binding {
+            id,
+            generation: item.generation,
+            slot,
+            active: false,
+        };
+        binding.sandbox()?;
+        prepare(binding, previous.is_some())?;
         txn.commit()?;
         Ok(binding)
     }

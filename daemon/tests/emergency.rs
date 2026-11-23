@@ -107,7 +107,6 @@ fn emergency_shutdown_fences_admissions_before_observing_the_vm() {
             id,
             |_| Ok(()),
             || {
-                assert!(directory.path().join(id.to_string()).is_file());
                 assert!(fences.with_open(id, || Ok(())).is_err());
                 Ok(true)
             },
@@ -115,7 +114,49 @@ fn emergency_shutdown_fences_admissions_before_observing_the_vm() {
         .unwrap();
     assert_eq!(outcome["broker_cutoff"], "VERIFIED");
     assert_eq!(outcome["shutdown"], "VERIFIED");
+    assert!(directory.path().join(id.to_string()).is_file());
     assert!(fences.guest_operation(id, || Ok(())).is_err());
+}
+
+#[test]
+fn emergency_shutdown_proceeds_while_broker_cutoff_is_stalled() {
+    let directory = tempdir().unwrap();
+    let fences = Arc::new(Fences::new(directory.path().to_path_buf()));
+    let id = Uuid::new_v4();
+    fences.register(id).unwrap();
+    let (finish_cut, release_cut) = mpsc::channel();
+    let (stopped, observed) = mpsc::channel();
+
+    let worker = std::thread::spawn(move || {
+        fences
+            .emergency_terminate(
+                id,
+                move |_| {
+                    release_cut.recv_timeout(Duration::from_secs(6)).unwrap();
+                    Ok(())
+                },
+                || {
+                    stopped.send(()).unwrap();
+                    Ok(true)
+                },
+            )
+            .unwrap()
+    });
+    let shutdown_was_independent = observed.recv_timeout(Duration::from_secs(1)).is_ok();
+    let outcome = if shutdown_was_independent {
+        let outcome = worker.join().unwrap();
+        finish_cut.send(()).unwrap();
+        outcome
+    } else {
+        finish_cut.send(()).unwrap();
+        worker.join().unwrap()
+    };
+    assert!(
+        shutdown_was_independent,
+        "VM shutdown waited for broker cutoff"
+    );
+    assert_eq!(outcome["shutdown"], "VERIFIED");
+    assert_eq!(outcome["broker_cutoff"], "UNKNOWN");
 }
 
 #[test]

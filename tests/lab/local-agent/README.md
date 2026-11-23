@@ -1,6 +1,6 @@
 # Local model containment lab
 
-Use a dedicated Ubuntu 24.04 x86-64 KVM environment with libvirt and a private lab network. The model runs with one vCPU and 1 GiB of guest RAM. The test uses a synthetic maintenance note, three fixed boundary checks, and one approved collector record. The network listener and HTTPS collector both stay on the private lab route.
+Use a dedicated Ubuntu 24.04 x86-64 KVM environment with libvirt and a private lab network. The model runs with one vCPU and 1 GiB of guest RAM. The test uses a synthetic maintenance note, fixed tool and output checks, and one approved collector record. The network listener and HTTPS collector both stay on the private lab route.
 
 ## Build the guest input
 
@@ -16,12 +16,12 @@ sha256sum model-runtime/llama-completion local-agent.img
 
 ## Run the qualification
 
-Install the candidate daemon, gateway, and controller per the [Linux deployment guide](../../../docs/DEPLOY_LINUX.md). Prepare the isolated collector network as in the [mediated lab](../README.md). Use `/opt/alethic-guard` as the virtual environment and compile a `broker-lab` policy targeting `https://collector.example:8443/v1/release-evidence`. Install the verified guest image as `noble-lab.qcow2` and the seed as `local-agent.img` in the approved image directory.
+Install the archive and services per the [Linux deployment guide](../../../docs/DEPLOY_LINUX.md). Prepare the isolated collector network as in the [mediated lab](../README.md). Compile a `broker-lab` policy targeting `https://collector.example:8443/v1/release-evidence`. Stage the verified `noble-lab.qcow2` guest image, `local-agent.img` seed, and a firmware-only `minimal.qcow2` volume as described in the [recovery procedure](../production/README.md).
 
-The harness starts the staging collector and controller. For this fixture, create dedicated users `guard-controller` and `guard-collector`, state directories of those names' roles under `/var/lib/alethic-guard/controller` and `/var/lib/alethic-guard/collector`, and a host-root configuration at `/etc/alethic-guard/policies/release-collector.json`. Place the staging TLS key and certificate in the collector directory as `tls.key` and `tls.pem`, and the distinct credentials as `writer` and `reader`. Bind the collector hostname to the lab-only IPv6 alias `2602:ff16::2` and place it in namespace `guard-release-collector` with address `fd42:abcd::2` on the link paired with `guard-observe`. Run the test in a working directory containing the public `ca.pem`, a canonical `approved-record.json` matching the host config, and a copy of [guard-operator.py](../guard-operator.py). Create `/lab/empty` for the controlled network listener.
+The harness starts the installed systemd services and a staging collector. Create the dedicated `guard-collector` user and its state directory under `/var/lib/alethic-guard/collector`. Install the host-root collector configuration at `/etc/alethic-guard/collector.json` with the UID of the installed `alethic-guard-controller` account. Place the staging TLS key and certificate in the collector directory as `tls.key` and `tls.pem`, and the distinct credentials as `writer` and `reader`. Bind the collector hostname to the lab-only IPv6 alias `2602:ff16::2` and place it in namespace `guard-release-collector` with address `fd42:abcd::2` on the link paired with `guard-observe`. Run the test in a working directory containing the public `ca.pem`, a canonical `approved-record.json` matching the host config, and a copy of [guard-operator.py](../guard-operator.py). Start with a fresh collector database. Create `/lab/empty` for the controlled network listener.
 
 ```sh
 sudo python3 /path/to/tests/lab/local-agent/qualify.py /path/to/results
 ```
 
-The harness calibrates the controlled listener, checks a matching HTTPS receipt, verifies that the emergency operation completes during ordinary enrollment work, and tests an unavailable shutdown observer by pausing the lab libvirt daemon. Export the results and retain `head.json` independently off the test host. Re-verify the exported events using that checkpoint and keep the archive, source, model, guest and seed digests alongside the result.
+The harness calibrates the controlled listener, checks a matching HTTPS receipt, verifies that the emergency operation completes during ordinary enrollment work, and tests an unavailable shutdown observer by pausing the lab libvirt daemon. It also verifies mediated host recovery after both Guard services stop. Export the results and retain `head.json` independently off the test host. Re-verify the exported events using that checkpoint and keep the archive, source, model, guest and seed digests alongside the result.

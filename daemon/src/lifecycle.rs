@@ -1,5 +1,6 @@
 use crate::{
     GuardResult,
+    evidence::{self, EventFields},
     vm::{DomainSpec, Hypervisor, VmState, verify_domain},
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -155,7 +156,10 @@ impl Registry {
     }
 
     pub fn open_for_recovery(path: &Path) -> GuardResult<Self> {
-        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         conn.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
         Ok(Self { conn })
     }
@@ -207,14 +211,19 @@ impl Registry {
         let txn = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if txn.execute(
+        Self::update_workload(&txn, item)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    fn update_workload(conn: &Connection, item: &Workload) -> GuardResult<()> {
+        if conn.execute(
             "UPDATE workloads SET record = ?1 WHERE id = ?2",
             params![serde_json::to_string(item)?, item.enrollment.id.to_string()],
         )? != 1
         {
             return Err("enrollment disappeared".into());
         }
-        txn.commit()?;
         Ok(())
     }
 
@@ -229,14 +238,13 @@ impl Registry {
         &mut self,
         id: Uuid,
         fence: impl FnOnce(Uuid) -> GuardResult<()>,
-        stop: impl FnOnce(Uuid) -> GuardResult<bool>,
+        stop: impl FnOnce(Uuid) -> GuardResult<bool> + Send,
     ) -> GuardResult<HostRecoveryReport> {
         let mut item = self.get(id)?.ok_or("unknown workload")?;
         if item.enrollment.id != id {
             return Err("registry enrollment identity mismatch".into());
         }
-        let intent = item.begin_containment(true).and_then(|()| self.save(&item));
-        let observe = |step, result| match result {
+        let observe = |step: &str, result: GuardResult<bool>| match result {
             Ok(true) => Observation::Verified,
             Ok(false) => Observation::Failed,
             Err(error) => {
@@ -244,12 +252,19 @@ impl Registry {
                 Observation::Unknown
             }
         };
-        let admissions = observe("admissions fence", fence(id).map(|()| true));
-        let broker_cutoff = observe(
-            "broker cutoff",
-            crate::broker::stop(self, Some(id)).map(|()| true),
-        );
-        let shutdown = observe("shutdown", stop(id));
+        let (intent, admissions, broker_cutoff, shutdown) = std::thread::scope(|scope| {
+            // The daemon lock prevents new effects during offline recovery.
+            // Start VM shutdown even if storage or network cleanup stalls.
+            let vm = scope.spawn(move || observe("shutdown", stop(id)));
+            let intent = item.begin_containment(true).and_then(|()| self.save(&item));
+            let admissions = observe("admissions fence", fence(id).map(|()| true));
+            let broker_cutoff = observe(
+                "broker cutoff",
+                crate::broker::stop(self, Some(id)).map(|()| true),
+            );
+            let shutdown = vm.join().unwrap_or(Observation::Unknown);
+            (intent, admissions, broker_cutoff, shutdown)
+        });
         let completed = [admissions, broker_cutoff, shutdown]
             .into_iter()
             .all(|observation| observation == Observation::Verified);
@@ -258,19 +273,31 @@ impl Registry {
             if broker_cutoff == Observation::Verified {
                 self.recover_workload_effects(Some(id))?;
             }
+            let txn = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
             if completed {
                 item.mode = Mode::Terminated;
-                self.save(&item)?;
+                Self::update_workload(&txn, &item)?;
             }
-            self.record_host_observation(
-                id,
-                "HOST_RECOVERY_OBSERVED",
-                if completed {
-                    "TERMINATED"
-                } else {
-                    "INCOMPLETE"
+            evidence::append(
+                &txn,
+                &item,
+                EventFields {
+                    event_type: "HOST_RECOVERY_OBSERVED",
+                    observer: "guardd_recovery",
+                    assurance: "HOST_VERIFIED",
+                    request_id: None,
+                    decision_id: None,
+                    result: if completed {
+                        "TERMINATED"
+                    } else {
+                        "INCOMPLETE"
+                    },
                 },
-            )
+            )?;
+            txn.commit()?;
+            Ok(())
         });
         Ok(HostRecoveryReport {
             id,
@@ -454,15 +481,23 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
         if item.mode != Mode::Paused || self.vm.state(id)? != VmState::Paused {
             return Err("resume requires a verified paused workload".into());
         }
-        if self.verify_active(&item).is_err()
-            || self.vm.resume(id).is_err()
-            || self.vm.state(id).ok() != Some(VmState::Running)
-        {
+        if self.verify_active(&item).is_err() {
+            self.contain(id, true)?;
+            return Err("unable to verify the paused domain".into());
+        }
+        item.mode = Mode::Starting;
+        self.registry.save(&item)?;
+        if self.vm.resume(id).is_err() || self.vm.state(id).ok() != Some(VmState::Running) {
             self.contain(id, true)?;
             return Err("unable to verify the resumed domain".into());
         }
         item.mode = Mode::Running;
-        self.registry.save(&item)?;
+        if let Err(error) = self.registry.save(&item) {
+            if let Err(cleanup) = self.contain(id, true) {
+                eprintln!("resumed VM containment for {id}: {cleanup}");
+            }
+            return Err(error);
+        }
         Ok(item)
     }
 
@@ -556,17 +591,28 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     }
 
     pub fn reconcile(&mut self) -> GuardResult<()> {
+        let mut errors = Vec::new();
         for item in self.registry.all()? {
             let id = item.enrollment.id;
-            if item.mode != Mode::Ready || !self.vm.verify_absent(id)? {
-                let result = self.contain(id, true)?;
-                if result.shutdown != Observation::Verified
-                    || result.broker_cutoff != Observation::Verified
-                {
-                    return Err(format!("startup could not verify shutdown for {id}").into());
+            let result = (|| -> GuardResult<()> {
+                if item.mode != Mode::Ready || !self.vm.verify_absent(id)? {
+                    let result = self.contain(id, true)?;
+                    if result.shutdown != Observation::Verified
+                        || result.broker_cutoff != Observation::Verified
+                    {
+                        return Err("could not verify shutdown and broker cutoff".into());
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!("startup reconciliation for {id}: {error}"));
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n").into())
+        }
     }
 }

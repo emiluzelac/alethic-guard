@@ -16,13 +16,18 @@ use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io,
-    os::unix::{fs::OpenOptionsExt, net::UnixListener},
+    os::unix::{
+        fs::OpenOptionsExt,
+        net::{UnixListener, UnixStream},
+    },
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -49,11 +54,44 @@ impl WorkloadGate {
         }
         Ok(())
     }
+
+    fn latch(&self) -> GuardResult<u64> {
+        // `try_update` is unavailable on the supported Rust 1.85 toolchain.
+        #[allow(deprecated)]
+        let previous = self
+            .generation
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |version| {
+                version.checked_add(2).map(|_| (version + 1) | 1)
+            })
+            .map_err(|_| "emergency cutoff generation exhausted")?;
+        Ok((previous + 1) | 1)
+    }
+}
+
+struct WorkerPermit(Arc<AtomicUsize>);
+
+impl WorkerPermit {
+    fn acquire(workers: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        #[allow(deprecated)]
+        workers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self(Arc::clone(workers)))
+    }
+}
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 pub struct Fences {
     root: PathBuf,
     gates: Mutex<HashMap<Uuid, Arc<WorkloadGate>>>,
+    cutoff_workers: Arc<AtomicUsize>,
 }
 
 impl Fences {
@@ -61,6 +99,7 @@ impl Fences {
         Self {
             root,
             gates: Mutex::new(HashMap::new()),
+            cutoff_workers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -69,24 +108,24 @@ impl Fences {
     }
 
     fn gate(&self, id: Uuid) -> GuardResult<Arc<WorkloadGate>> {
+        if let Some(gate) = self.registered_gate(id)? {
+            return Ok(gate);
+        }
+        let initial = u64::from(self.marker(id).try_exists()?);
         let mut gates = self
             .gates
             .lock()
             .map_err(|_| "emergency gate registry unavailable")?;
-        if let Some(gate) = gates.get(&id) {
-            return Ok(Arc::clone(gate));
-        }
-        let initial = u64::from(self.marker(id).try_exists()?);
-        let gate = Arc::new(WorkloadGate {
-            generation: AtomicU64::new(initial),
-            transition: Mutex::new(NetworkState {
-                completed_cutoff: initial,
-                sandbox: None,
-            }),
-            guest: Mutex::new(()),
-        });
-        gates.insert(id, Arc::clone(&gate));
-        Ok(gate)
+        Ok(Arc::clone(gates.entry(id).or_insert_with(|| {
+            Arc::new(WorkloadGate {
+                generation: AtomicU64::new(initial),
+                transition: Mutex::new(NetworkState {
+                    completed_cutoff: initial,
+                    sandbox: None,
+                }),
+                guest: Mutex::new(()),
+            })
+        })))
     }
 
     pub fn register(&self, id: Uuid) -> GuardResult<()> {
@@ -105,12 +144,13 @@ impl Fences {
         Ok(())
     }
 
-    fn is_registered(&self, id: Uuid) -> GuardResult<bool> {
+    fn registered_gate(&self, id: Uuid) -> GuardResult<Option<Arc<WorkloadGate>>> {
         Ok(self
             .gates
             .lock()
             .map_err(|_| "emergency gate registry unavailable")?
-            .contains_key(&id))
+            .get(&id)
+            .cloned())
     }
 
     pub fn with_open<T>(&self, id: Uuid, run: impl FnOnce() -> GuardResult<T>) -> GuardResult<T> {
@@ -153,19 +193,24 @@ impl Fences {
         cut: impl FnOnce(Option<Sandbox>) -> GuardResult<T>,
     ) -> GuardResult<T> {
         let gate = self.gate(id)?;
-        // `try_update` is unavailable on the supported Rust 1.85 toolchain.
-        #[allow(deprecated)]
-        let previous = gate
-            .generation
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |version| {
-                version.checked_add(2).map(|_| (version + 1) | 1)
-            })
-            .map_err(|_| "emergency cutoff generation exhausted")?;
-        let version = (previous + 1) | 1;
+        let version = gate.latch()?;
+        Self::complete_cutoff(&gate, &self.root, id, version, cut)
+    }
+
+    fn complete_cutoff<T>(
+        gate: &WorkloadGate,
+        root: &Path,
+        id: Uuid,
+        version: u64,
+        cut: impl FnOnce(Option<Sandbox>) -> GuardResult<T>,
+    ) -> GuardResult<T> {
         let mut network = gate
             .transition
             .lock()
             .map_err(|_| "workload emergency gate unavailable")?;
+        if version < network.completed_cutoff {
+            return Err("a newer emergency cutoff already completed".into());
+        }
         let result = cut(network.sandbox);
         let durable = (|| -> GuardResult<()> {
             let file = OpenOptions::new()
@@ -174,9 +219,9 @@ impl Fences {
                 .write(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(self.marker(id))?;
+                .open(root.join(id.to_string()))?;
             file.sync_all()?;
-            File::open(&self.root)?.sync_all()?;
+            File::open(root)?.sync_all()?;
             Ok(())
         })();
         durable?;
@@ -185,25 +230,44 @@ impl Fences {
         Ok(observed)
     }
 
+    fn background_cutoff(
+        &self,
+        id: Uuid,
+        gate: Arc<WorkloadGate>,
+        cut: impl FnOnce(Option<Sandbox>) -> GuardResult<()> + Send + 'static,
+    ) -> GuardResult<mpsc::Receiver<Observation>> {
+        // Fence new grants before scheduling work that may block on the host.
+        let version = gate.latch()?;
+        let (send, receive) = mpsc::sync_channel(1);
+        if let Some(permit) = WorkerPermit::acquire(&self.cutoff_workers, 8) {
+            let root = self.root.clone();
+            if let Err(error) = thread::Builder::new().spawn(move || {
+                let _permit = permit;
+                let observation = match Self::complete_cutoff(&gate, &root, id, version, cut) {
+                    Ok(()) => Observation::Verified,
+                    Err(error) => {
+                        eprintln!("emergency cutoff for {id}: {error}");
+                        Observation::Unknown
+                    }
+                };
+                let _ = send.send(observation);
+            }) {
+                eprintln!("starting cutoff worker for {id}: {error}");
+            }
+        }
+        Ok(receive)
+    }
+
     pub fn emergency_terminate(
         &self,
         id: Uuid,
-        cut: impl FnOnce(Option<Sandbox>) -> GuardResult<()>,
+        cut: impl FnOnce(Option<Sandbox>) -> GuardResult<()> + Send + 'static,
         stop: impl FnOnce() -> GuardResult<bool>,
     ) -> GuardResult<serde_json::Value> {
-        if !self.is_registered(id)? {
-            return Err("unmanaged workload".into());
-        }
-        let gate = self.gate(id)?;
+        let gate = self.registered_gate(id)?.ok_or("unmanaged workload")?;
         // Even a stuck start or resume must not delay fencing broker admissions.
         let guest = gate.guest.try_lock().ok();
-        let cutoff = self.cutoff(id, cut);
-        let fenced = if let Err(error) = cutoff {
-            eprintln!("emergency cutoff for {id}: {error}");
-            Observation::Unknown
-        } else {
-            Observation::Verified
-        };
+        let cutoff = self.background_cutoff(id, Arc::clone(&gate), cut)?;
         // Keep the transition guard through both observation timestamps.
         let shutdown = if guest.is_some() {
             match stop() {
@@ -217,6 +281,9 @@ impl Fences {
         } else {
             Observation::Unknown
         };
+        let fenced = cutoff
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(Observation::Unknown);
         Ok(json!({
             "id": id,
             "admissions": fenced,
@@ -303,7 +370,43 @@ fn unix_ns() -> GuardResult<u64> {
     )?)
 }
 
-pub fn serve(listener: UnixListener, fences: &Fences) {
+fn handle(mut stream: UnixStream, fences: &Fences) {
+    let response = (|| -> GuardResult<serde_json::Value> {
+        configure(&stream)?;
+        if peer_uid(&stream)? != 0 {
+            return Err("host root is required for emergency operations".into());
+        }
+        let cut = |sandbox: Option<Sandbox>| sandbox.map_or(Ok(()), Sandbox::seal);
+        let id = match read_frame(&stream)? {
+            Request::Cutoff { id } => id,
+            Request::Terminate { id } => {
+                return fences.emergency_terminate(id, cut, || Libvirt::emergency_shutdown(id));
+            }
+        };
+        let gate = fences.registered_gate(id)?.ok_or("unmanaged workload")?;
+        let cutoff = fences.background_cutoff(id, gate, cut)?;
+        let fenced = cutoff
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap_or(Observation::Unknown);
+        Ok(json!({
+            "id": id,
+            "admissions": fenced,
+            "broker_cutoff": fenced,
+            "observed_at_unix_ns": unix_ns()?,
+            "host_monotonic_ns": monotonic_ns()?,
+        }))
+    })();
+    let envelope = match response {
+        Ok(result) => json!({"ok": true, "result": result}),
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    };
+    if let Err(error) = write_frame(&mut stream, &envelope) {
+        eprintln!("emergency response failed: {error}");
+    }
+}
+
+pub fn serve(listener: UnixListener, fences: &Arc<Fences>) {
+    let workers = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(stream) => stream,
@@ -312,43 +415,23 @@ pub fn serve(listener: UnixListener, fences: &Fences) {
                 continue;
             }
         };
-        let response = (|| -> GuardResult<serde_json::Value> {
-            configure(&stream)?;
-            if peer_uid(&stream)? != 0 {
-                return Err("host root is required for emergency operations".into());
-            }
-            let id = match read_frame(&stream)? {
-                Request::Cutoff { id } => id,
-                Request::Terminate { id } => {
-                    return fences.emergency_terminate(
-                        id,
-                        |sandbox| sandbox.map_or(Ok(()), Sandbox::seal),
-                        || Libvirt::emergency_shutdown(id),
-                    );
-                }
-            };
-            if !fences.is_registered(id)? {
-                return Err("unmanaged workload".into());
-            }
-            fences.cutoff(id, |sandbox| {
-                if let Some(sandbox) = sandbox {
-                    sandbox.seal()?;
-                }
-                Ok(json!({
-                    "id": id,
-                    "admissions": "VERIFIED",
-                    "broker_cutoff": "VERIFIED",
-                    "observed_at_unix_ns": unix_ns()?,
-                    "host_monotonic_ns": monotonic_ns()?,
-                }))
-            })
-        })();
-        let envelope = match response {
-            Ok(result) => json!({"ok": true, "result": result}),
-            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        let Some(permit) = WorkerPermit::acquire(&workers, 8) else {
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+            let _ = write_frame(
+                &mut stream,
+                &json!({
+                    "ok": false,
+                    "error": "emergency request capacity reached; retry this request",
+                }),
+            );
+            continue;
         };
-        if let Err(error) = write_frame(&mut stream, &envelope) {
-            eprintln!("emergency response failed: {error}");
+        let fences = Arc::clone(fences);
+        if let Err(error) = thread::Builder::new().spawn(move || {
+            let _permit = permit;
+            handle(stream, &fences);
+        }) {
+            eprintln!("starting emergency request worker: {error}");
         }
     }
 }

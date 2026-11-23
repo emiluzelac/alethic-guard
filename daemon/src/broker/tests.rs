@@ -13,6 +13,70 @@ fn record_binding(registry: &Registry, id: Uuid, slot: i64, retired: bool) {
 }
 
 #[test]
+fn a_retired_slot_can_only_be_reused_by_its_enrollment() {
+    let mut registry = Registry::memory().unwrap();
+    let mut enrollment = crate::lifecycle::Enrolled {
+        id: Uuid::new_v4(),
+        profile: "mediated".into(),
+        policy_digest: "test-policy".into(),
+        image: "/approved/image.qcow2".into(),
+        image_digest: "test-image".into(),
+        input: None,
+        input_digest: None,
+        broker: true,
+    };
+    let mut workload = registry.enroll(&enrollment).unwrap();
+    let first = registry
+        .reserve_gateway_with(&workload, |_, reused| {
+            assert!(!reused);
+            Ok(())
+        })
+        .unwrap();
+    assert!(
+        registry
+            .reserve_gateway_with(&workload, |_, _| panic!("active slot"))
+            .is_err()
+    );
+    registry.set_gateway(first, false, true).unwrap();
+    registry
+        .conn
+        .execute(
+            "INSERT INTO gateway_processes VALUES (?1, 200, 1)",
+            [first.slot],
+        )
+        .unwrap();
+
+    enrollment.id = Uuid::new_v4();
+    let other = registry.enroll(&enrollment).unwrap();
+    let other_binding = registry
+        .reserve_gateway_with(&other, |_, _| Ok(()))
+        .unwrap();
+    assert_ne!(other_binding.slot, first.slot);
+
+    workload.generation += 1;
+    let failed =
+        registry.reserve_gateway_with(&workload, |_, _| Err("namespace still present".into()));
+    assert!(failed.is_err());
+    let next = registry
+        .reserve_gateway_with(&workload, |_, reused| {
+            assert!(reused);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(next.slot, first.slot);
+    assert_eq!(next.generation, workload.generation);
+    let old_process: u32 = registry
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM gateway_processes WHERE slot=?1",
+            [next.slot],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_process, 0);
+}
+
+#[test]
 fn stop_sweeps_later_matching_bindings_after_a_host_operation_fails() {
     let id = Uuid::from_u128(1);
     let other = Uuid::from_u128(2);
