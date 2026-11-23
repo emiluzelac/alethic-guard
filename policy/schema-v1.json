@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["api_version", "kind", "metadata", "spec"],
+  "properties": {
+    "api_version": {"const": "guard.alethic.dev/v1"},
+    "kind": {"const": "WorkloadPolicy"},
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {"name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$"}}
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "isolation", "enforce", "default_action", "filesystem", "network", "tools", "emergency", "evidence"],
+      "properties": {
+        "profile": {"enum": ["offline-strict", "allowlisted-api", "supervised-transfer", "monitor-only"]},
+        "isolation": {"const": "vm-isolated"},
+        "enforce": {"type": "boolean", "const": true},
+        "default_action": {"const": "deny"},
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["inputs", "outputs", "host_home_mount", "shared_clipboard", "sync_services"],
+          "properties": {
+            "inputs": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/input"}},
+            "outputs": {"type": "array", "maxItems": 1, "items": {"$ref": "#/$defs/output"}},
+            "host_home_mount": {"const": "deny"},
+            "shared_clipboard": {"const": "deny"},
+            "sync_services": {"const": "deny"}
+          }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["guest_direct_egress", "guest_inbound", "dns", "ipv6", "approved_broker_destinations"],
+          "properties": {
+            "guest_direct_egress": {"const": "deny_all"},
+            "guest_inbound": {"const": "deny_all"},
+            "dns": {"const": "deny"},
+            "ipv6": {"const": "deny"},
+            "approved_broker_destinations": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"type": "string", "maxLength": 240}}
+          }
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed", "shell", "external_http"],
+          "properties": {
+            "allowed": {"type": "array", "uniqueItems": true, "items": {"enum": ["local_inference", "local_read", "local_write_results", "collector.publish"]}},
+            "shell": {"const": "deny"},
+            "external_http": {"const": "deny"}
+          }
+        },
+        "emergency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["on_policy_engine_unavailable", "on_controller_unavailable", "restart_after_containment"],
+          "properties": {
+            "on_policy_engine_unavailable": {"const": "deny_new_effects"},
+            "on_controller_unavailable": {"const": "deny_new_effects"},
+            "restart_after_containment": {"const": "require_manual_release"}
+          }
+        },
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["host_side_events", "include_sensitive_payloads"],
+          "properties": {
+            "host_side_events": {"const": "required"},
+            "include_sensitive_payloads": {"type": "boolean", "const": false}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "access"],
+      "properties": {"path": {"type": "string"}, "access": {"const": "read_only"}}
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "access"],
+      "properties": {"path": {"type": "string"}, "access": {"const": "read_write"}}
+    }
+  }
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alethic-guard"
+version = "0.1.0.dev0"
+requires-python = ">=3.11"
+description = "Host-enforced execution controls for enrolled Alethic workloads"
+dependencies = ["PyYAML>=6,<7", "jsonschema>=4.23,<5"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+alethic-guard = "alethic_guard_cli.main:main"
+
+[tool.setuptools]
+packages = ["alethic_guard", "alethic_guard_cli", "alethic_guard_policy_data"]
+
+[tool.setuptools.package-dir]
+alethic_guard = "controller/alethic_guard"
+alethic_guard_cli = "cli/alethic_guard_cli"
+alethic_guard_policy_data = "policy"
+
+[tool.setuptools.package-data]
+alethic_guard_policy_data = ["schema-v1.json", "examples/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

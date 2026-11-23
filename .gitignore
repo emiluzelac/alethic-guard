@@ -1,0 +1,8 @@
+/.venv/
+/.wheels/
+/build/
+/dist/
+/target/
+*.egg-info/
+__pycache__/
+.pytest_cache/
