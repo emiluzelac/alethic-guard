@@ -65,3 +65,34 @@ sudo /usr/local/sbin/alethic-guardd /var/lib/alethic-guard /etc/alethic-guard/po
 ```
 
 The mediated operator socket parent must permit traversal by the dedicated gateway users. The socket is limited by owner/group and peer credentials. Guard creates a second socket at `operator.sock.emergency`, with mode `0600` and a host-root peer check, for `workload cutoff`. During startup, the daemon stops and reconciles any gateway from a previous incarnation before admitting new work. Rotate the root-owned configuration and requalify if you change the collector address, TLS trust, guest image, or backend. See [the lab instructions](../tests/lab/README.md).
+
+## Release evidence staging
+
+On a source build, set the same exact HTTPS destination in the compiled policy and the collector configuration, with path `/v1/release-evidence`. Add this property to the collector JSON and install the file as root-owned mode `0400` in a protected directory.
+
+```json
+{
+  "release_evidence": {
+    "record": {
+      "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "verdict": "pass",
+      "version": 1
+    },
+    "writer_token": "replace_with_a_generated_writer_token"
+  }
+}
+```
+
+The trusted operator sets the 40-character lowercase Git commit, 64-character lowercase artifact SHA-256, and `pass` or `fail` verdict. To request delivery, the guest calls `collector.publish` with its request UUID and `fixture_id` set to `release-evidence`. Guard serializes the approved record and binds its SHA-256 and the destination to the one-use grant.
+
+Run the receiver under a dedicated account that can read its TLS key and token files and write to the SQLite state directory. Use distinct randomly generated URL-safe writer and reader tokens of 32–128 characters. Give the gateway its writer token through the protected collector configuration and give the reader token to the trusted receipt operator.
+
+```sh
+/opt/alethic-guard/venv/bin/python -I -m alethic_guard.release_evidence_collector \
+  --host COLLECTOR_ADDRESS --port 8443 --database /var/lib/collector/evidence.sqlite3 \
+  --cert /etc/collector/tls.pem --key /etc/collector/tls.key \
+  --writer-token-file /etc/collector/writer-token --reader-token-file /etc/collector/reader-token
+```
+
+Use the reader credential over verified TLS to retrieve `GET /v1/release-evidence/<idempotency-key>`. The response contains the key and payload SHA-256. Repeated writes of the same canonical bytes with the same key return the original receipt. Reusing a key with a different record returns HTTP 409. After an ambiguous delivery, read the receipt independently and use the root operator’s `reconcile_receipt` command with the original workload and request IDs. Persist the SQLite file and its sidecars across collector restarts.

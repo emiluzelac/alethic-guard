@@ -3,13 +3,14 @@ use alethic_guardd::{
     GuardResult,
     auth::peer_uid,
     broker::Prepared,
-    collector::{Collector, GuestRequest, public_ip},
+    collector::{Collector, GuestRequest, RELEASE_EVIDENCE_PATH, public_ip},
     effect::Outcome,
     protocol::{configure, read_frame, write_frame},
 };
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
@@ -69,6 +70,14 @@ fn collect(
     if prepared.dial.port() != target.port || !public_ip(prepared.dial.ip()) {
         return Err("dial address outside the collector boundary".into());
     }
+    let authorization = if let Some(delivery) = &prepared.release_evidence {
+        if target.path != RELEASE_EVIDENCE_PATH {
+            return Err("release evidence requires the release endpoint".into());
+        }
+        format!("Authorization: Bearer {}\r\n", delivery.writer_token)
+    } else {
+        String::new()
+    };
     let recheck = || -> GuardResult<()> {
         rpc::<Value>(
             daemon,
@@ -97,7 +106,7 @@ fn collect(
     };
     let mut request = format!(
         "POST {} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nIdempotency-Key: {}\r\nConnection: close\r\n\r\n",
+         Content-Length: {}\r\nIdempotency-Key: {}\r\n{authorization}Connection: close\r\n\r\n",
         target.path,
         payload.len(),
         prepared.action.idempotency_key,
@@ -120,12 +129,16 @@ fn process_request(
     tls: Arc<ClientConfig>,
     incoming: GuestRequest,
 ) -> GuardResult<Outcome> {
-    let body = incoming.payload()?;
-    let digest = incoming.payload_digest()?;
     let prepared: Prepared = rpc(
         daemon,
         json!({"command": "broker_prepare", "request": incoming}),
     )?;
+    let body = match &prepared.release_evidence {
+        Some(delivery) if incoming.selects_release_evidence() => delivery.body()?,
+        None => incoming.payload()?.to_vec(),
+        Some(_) => return Err("daemon returned an unexpected release record".into()),
+    };
+    let digest = format!("{:x}", Sha256::digest(&body));
     if prepared.action.operation != incoming.operation
         || prepared.action.request_id != incoming.request_id
         || prepared.action.payload_sha256 != digest
@@ -140,7 +153,7 @@ fn process_request(
         }),
     )?;
     let mut sent = false;
-    let outcome = match collect(daemon, tls, &prepared, body, &mut sent) {
+    let outcome = match collect(daemon, tls, &prepared, &body, &mut sent) {
         Ok(()) => Outcome::Succeeded,
         Err(error) => {
             eprintln!("collector transport: {error}");
@@ -165,7 +178,9 @@ fn process_request(
 fn parse_request(daemon: &Path, frame: &[u8]) -> GuardResult<GuestRequest> {
     let request = serde_json::from_slice::<GuestRequest>(frame);
     match request {
-        Ok(request) if request.payload().is_ok() => Ok(request),
+        Ok(request) if request.payload().is_ok() || request.selects_release_evidence() => {
+            Ok(request)
+        }
         denied => {
             let reason = if denied.is_ok() {
                 "unapproved_fixture"

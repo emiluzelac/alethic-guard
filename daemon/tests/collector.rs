@@ -65,3 +65,50 @@ fn test_guest_cannot_supply_role_workload_labels_or_target() {
         serde_json::from_str(&request.replace("public-demo", "private-canary")).unwrap();
     assert!(invalid.payload().is_err());
 }
+
+#[test]
+fn release_evidence_uses_only_the_host_approved_record_and_selector() {
+    let digest = "a".repeat(64);
+    let commit = "b".repeat(40);
+    let token = "c".repeat(32);
+    let config = serde_json::from_value::<alethic_guardd::collector::CollectorConfig>(
+        serde_json::json!({
+            "target": "https://collector.example/v1/release-evidence",
+            "addresses": ["45.91.11.1"],
+            "gateway": "/usr/local/bin/gateway",
+            "controller_socket": "/run/controller.sock",
+            "controller_uid": 1000,
+            "release_evidence": {
+                "record": {"artifact_sha256": digest, "commit": commit, "verdict": "pass", "version": 1},
+                "writer_token": token,
+            }
+        }),
+    )
+    .unwrap();
+    let mut request = GuestRequest {
+        request_id: Uuid::new_v4(),
+        operation: "collector.publish".to_owned(),
+        fixture_id: "release-evidence".to_owned(),
+    };
+    let delivery = config.delivery(&request).unwrap().unwrap();
+    let expected = format!(
+        r#"{{"artifact_sha256":"{digest}","commit":"{commit}","verdict":"pass","version":1}}"#
+    );
+    assert_eq!(delivery.body().unwrap(), expected.as_bytes());
+    request.fixture_id = "public-demo".to_owned();
+    assert!(config.delivery(&request).is_err());
+
+    let mut invalid = config;
+    invalid
+        .release_evidence
+        .as_mut()
+        .unwrap()
+        .writer_token
+        .push('\n');
+    request.fixture_id = "release-evidence".to_owned();
+    assert!(invalid.delivery(&request).is_err());
+    invalid.release_evidence = None;
+    assert!(invalid.delivery(&request).is_err());
+    request.fixture_id = "public-demo".to_owned();
+    assert!(invalid.delivery(&request).unwrap().is_none());
+}

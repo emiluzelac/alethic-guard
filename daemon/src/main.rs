@@ -2,7 +2,7 @@ use alethic_guardd::{
     GuardResult,
     auth::peer_credentials,
     broker,
-    collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest},
+    collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest, RELEASE_EVIDENCE_PATH},
     digest_file,
     effect::{Action, Outcome},
     emergency::{self, Fences},
@@ -537,7 +537,8 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
         .and_then(|name| name.to_str())
         .ok_or("invalid config filename")?;
     let path = approved_file(dir, file)?;
-    if path.metadata()?.len() > 4096 {
+    let metadata = path.metadata()?;
+    if metadata.len() > 4096 {
         return Err("collector configuration exceeds maximum size".into());
     }
     let config: CollectorConfig = serde_json::from_slice(&fs::read(path)?)?;
@@ -567,6 +568,14 @@ fn load_collector(path: &Path) -> GuardResult<CollectorConfig> {
         approved_file(ca.parent().ok_or("missing CA file parent")?, file)?;
     }
     let collector = Collector::parse_url(&config.target)?;
+    if let Some(delivery) = &config.release_evidence {
+        if metadata.mode() & 0o077 != 0 || collector.path != RELEASE_EVIDENCE_PATH {
+            return Err(
+                "release evidence requires a root-only configuration and release endpoint".into(),
+            );
+        }
+        delivery.body()?;
+    }
     collector.resolve(&config.addresses)?;
     Ok(config)
 }

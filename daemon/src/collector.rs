@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub const FIXTURE: &[u8] = br#"{"kind":"alethic-guard-synthetic","value":1}"#;
+pub const RELEASE_EVIDENCE_PATH: &str = "/v1/release-evidence";
 pub const BROKER_GROUP: u32 = 300_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -26,12 +27,16 @@ impl GuestRequest {
         Ok(FIXTURE)
     }
 
+    pub fn selects_release_evidence(&self) -> bool {
+        self.operation == "collector.publish" && self.fixture_id == "release-evidence"
+    }
+
     pub fn payload_digest(&self) -> GuardResult<String> {
         Ok(format!("{:x}", Sha256::digest(self.payload()?)))
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectorConfig {
     pub target: String,
@@ -40,6 +45,70 @@ pub struct CollectorConfig {
     pub controller_socket: PathBuf,
     pub controller_uid: u32,
     pub ca_file: Option<PathBuf>,
+    pub release_evidence: Option<ReleaseDelivery>,
+}
+
+impl CollectorConfig {
+    pub fn delivery(&self, request: &GuestRequest) -> GuardResult<Option<&ReleaseDelivery>> {
+        if let Some(delivery) = &self.release_evidence {
+            if request.selects_release_evidence()
+                && Collector::parse_url(&self.target)?.path == RELEASE_EVIDENCE_PATH
+            {
+                delivery.body()?;
+                return Ok(Some(delivery));
+            }
+            return Err("unapproved release evidence request or destination".into());
+        }
+        request.payload()?;
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseDelivery {
+    pub record: ReleaseEvidence,
+    pub writer_token: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseEvidence {
+    artifact_sha256: String,
+    commit: String,
+    verdict: Verdict,
+    version: u8,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Verdict {
+    Pass,
+    Fail,
+}
+
+impl ReleaseDelivery {
+    pub fn body(&self) -> GuardResult<Vec<u8>> {
+        let lowercase_hex = |value: &str, length| {
+            value.len() == length
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if self.record.version != 1
+            || !lowercase_hex(&self.record.artifact_sha256, 64)
+            || !lowercase_hex(&self.record.commit, 40)
+            || !(32..=128).contains(&self.writer_token.len())
+            || !self
+                .writer_token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        {
+            return Err("invalid release evidence record or credential".into());
+        }
+        // The HTTPS receiver verifies these exact canonical bytes.
+        Ok(serde_json::to_vec(&self.record)?)
+    }
 }
 
 #[derive(Clone, Debug)]

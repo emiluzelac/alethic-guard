@@ -2,7 +2,7 @@
 use crate::{
     GuardResult,
     auth::peer_uid,
-    collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest},
+    collector::{BROKER_GROUP, Collector, CollectorConfig, GuestRequest, ReleaseDelivery},
     effect::{Action, Governance},
     emergency::Fences,
     evidence,
@@ -14,6 +14,7 @@ use crate::{
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     net::SocketAddr,
     os::{
@@ -51,6 +52,8 @@ pub struct Prepared {
     pub action: Action,
     pub nonce: Uuid,
     pub dial: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_evidence: Option<ReleaseDelivery>,
 }
 
 pub fn initialize(conn: &Connection) -> GuardResult<()> {
@@ -202,7 +205,11 @@ pub fn prepare(
     if !row.enrollment.broker || row.mode != Mode::Running || row.generation != binding.generation {
         return Err("gateway generation is inactive".into());
     }
-    let body_digest = request.payload_digest()?;
+    let delivery = config.delivery(&request)?;
+    let body_digest = match delivery {
+        Some(delivery) => format!("{:x}", Sha256::digest(delivery.body()?)),
+        None => request.payload_digest()?,
+    };
     let collector = Collector::parse_url(&config.target)?;
     let resolved = collector.resolve(&config.addresses)?;
     let dial = resolved
@@ -236,6 +243,7 @@ pub fn prepare(
         action,
         nonce,
         dial,
+        release_evidence: delivery.cloned(),
     })
 }
 
