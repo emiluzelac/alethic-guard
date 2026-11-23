@@ -78,6 +78,8 @@ def verify_release_race(output, workload, daemon_pid):
         _, error = release.communicate(timeout=120)
         (output / "release-race-refused.txt").write_text(error)
         assert release.returncode and "newer emergency cutoff" in error, error
+    status = record(output, "release-race-status", call("status", workload))
+    assert status["mode"] == "TERMINATED", status
     start = subprocess.run(operator("start", workload), capture_output=True, text=True)
     assert start.returncode and "cutoff is latched" in start.stderr, start.stderr
     released = record(output, "explicit-release", call("release", workload))

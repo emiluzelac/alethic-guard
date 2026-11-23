@@ -410,16 +410,19 @@ impl<'a, H: Hypervisor> Lifecycle<'a, H> {
     }
 
     pub fn release(&mut self, id: Uuid) -> GuardResult<Workload> {
-        self.release_latched(id, false)
+        let item = self.verify_releasable(id)?;
+        self.complete_release(item)
     }
 
-    pub fn release_latched(&mut self, id: Uuid, latched: bool) -> GuardResult<Workload> {
-        let mut item = self.known(id)?;
-        let releasable = matches!(item.mode, Mode::Contained | Mode::Terminated)
-            || (latched && item.mode == Mode::Ready);
-        if !releasable || !self.vm.verify_absent(id)? {
+    pub fn verify_releasable(&self, id: Uuid) -> GuardResult<Workload> {
+        let item = self.known(id)?;
+        if !matches!(item.mode, Mode::Contained | Mode::Terminated) || !self.vm.verify_absent(id)? {
             return Err("release requires a contained workload with verified shutdown".into());
         }
+        Ok(item)
+    }
+
+    pub fn complete_release(&mut self, mut item: Workload) -> GuardResult<Workload> {
         item.mode = Mode::Ready;
         item.overlay = None;
         item.runtime_base = None;

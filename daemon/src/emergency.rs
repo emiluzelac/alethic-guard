@@ -167,10 +167,16 @@ impl Fences {
         Ok(observed)
     }
 
-    pub fn release<T>(&self, id: Uuid, run: impl FnOnce(bool) -> GuardResult<T>) -> GuardResult<T> {
-        let gate = self.gate(id)?;
+    pub fn release<T>(&self, id: Uuid, run: impl FnOnce() -> GuardResult<T>) -> GuardResult<T> {
+        let gate = self
+            .gates
+            .lock()
+            .map_err(|_| "emergency gate registry unavailable")?
+            .get(&id)
+            .cloned()
+            .ok_or("unmanaged workload")?;
         let version = gate.generation();
-        let result = run(version % 2 == 1)?;
+        let result = run()?;
         let network = gate
             .transition
             .lock()

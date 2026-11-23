@@ -16,16 +16,11 @@ fn cutoff_latches_across_reopen_and_requires_successful_release() {
     assert!(reopened.with_open(id, || Ok(())).is_err());
     assert!(
         reopened
-            .release(id, |_| Err::<(), _>("release denied".into()))
+            .release(id, || Err::<(), _>("release denied".into()))
             .is_err()
     );
     assert!(reopened.with_open(id, || Ok(())).is_err());
-    reopened
-        .release(id, |latched| {
-            assert!(latched);
-            Ok(())
-        })
-        .unwrap();
+    reopened.release(id, || Ok(())).unwrap();
     assert!(reopened.with_open(id, || Ok(())).is_ok());
 }
 
@@ -75,13 +70,10 @@ fn slow_ordinary_work_and_a_stale_release_cannot_hold_off_cutoff() {
     });
     assert!(normal.is_err());
 
-    let stale_release = fences.release(id, |latched| {
-        assert!(latched);
-        fences.cutoff(id, |_| Ok(()))
-    });
+    let stale_release = fences.release(id, || fences.cutoff(id, |_| Ok(())));
     assert!(stale_release.is_err());
     assert!(fences.with_open(id, || Ok(())).is_err());
-    fences.release(id, |_| Ok(())).unwrap();
+    fences.release(id, || Ok(())).unwrap();
     assert!(fences.with_open(id, || Ok(())).is_ok());
 }
 
